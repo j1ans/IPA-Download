@@ -1524,13 +1524,10 @@ struct VersionsResponse: Decodable {
 /// 一个系统世代。版本 ID 落在 [startVersionID, endVersionID) 内的 App 版本，
 /// 大致就是这一代系统当道时发布的，因而最可能跑得动。
 ///
-/// 只按系统大版本划分，不区分机型：同一个大版本里的多个硬件节点（比如 iOS 14.0 的
-/// iPad Air 4 与 iOS 14.1 的 iPhone 12）会合并成一代。
+/// 只按系统大版本划分：不区分机型，小版本也一律并入大版本（4.2、4.3 都算 iOS 4）。
 struct CompatibilityGeneration: Identifiable, Hashable {
     let id: String
     let osName: String
-    /// 这一代期间发布的代表机型，仅供参考，不参与划分。
-    let deviceHint: String
     let releaseDate: Date
     let startVersionID: Int64
     /// 下一代的起点（不含）；最后一代为 Int64.max。
@@ -1565,17 +1562,12 @@ struct CompatibilityGeneration: Identifiable, Hashable {
 /// 注意 Apple 在 2013 到 2014 年之间换过一次编号体系（16765251 → 691954036，量级
 /// 从千万跳到亿），因此只能在相邻锚点之间分段线性插值，不能对全体锚点做整体拟合。
 enum VersionIDTimeline {
-    struct Milestone: Hashable {
-        /// 系统大版本，世代按它合并；同一个大版本的多个硬件节点算同一代。
-        let osFamily: String
-        let device: String
-    }
-
     struct Anchor {
         let versionID: Int64
         let date: Date
-        /// 对应的设备/系统里程碑；纯粹用于校准时间的锚点为 nil。
-        let milestone: Milestone?
+        /// 该锚点开启的系统大版本；纯粹用于校准时间的锚点为 nil。
+        /// 只记大版本 —— 小版本不单列，注释里的机型仅说明这个日期的出处。
+        let osFamily: String?
     }
 
     private static func day(_ year: Int, _ month: Int, _ dayOfMonth: Int) -> Date {
@@ -1590,74 +1582,43 @@ enum VersionIDTimeline {
 
     /// 按版本 ID 升序排列。
     static let anchors: [Anchor] = [
-        Anchor(versionID: 17191, date: day(2008, 7, 2),
-               milestone: Milestone(osFamily: "iPhone OS 2", device: "iPhone 3G")),
-        Anchor(versionID: 1804602, date: day(2009, 6, 24),
-               milestone: Milestone(osFamily: "iPhone OS 3", device: "iPhone 3GS")),
-        Anchor(versionID: 1996524, date: day(2009, 10, 1), milestone: nil),
-        Anchor(versionID: 2243141, date: day(2010, 2, 11),
-               milestone: Milestone(osFamily: "iPhone OS 3", device: "iPad")),
-        Anchor(versionID: 2479772, date: day(2010, 4, 1), milestone: nil),
-        Anchor(versionID: 2694492, date: day(2010, 6, 15),
-               milestone: Milestone(osFamily: "iOS 4", device: "iPhone 4")),
-        Anchor(versionID: 3493095, date: day(2011, 3, 10),
-               milestone: Milestone(osFamily: "iOS 4", device: "iPad 2")),
-        Anchor(versionID: 4375195, date: day(2011, 10, 12),
-               milestone: Milestone(osFamily: "iOS 5", device: "iPhone 4s")),
-        Anchor(versionID: 6811179, date: day(2012, 3, 7),
-               milestone: Milestone(osFamily: "iOS 5", device: "iPad 3")),
-        Anchor(versionID: 10631785, date: day(2012, 9, 19),
-               milestone: Milestone(osFamily: "iOS 6", device: "iPhone 5")),
-        Anchor(versionID: 16765251, date: day(2013, 9, 9),
-               milestone: Milestone(osFamily: "iOS 7", device: "iPhone 5s")),
-        Anchor(versionID: 691954036, date: day(2014, 9, 9),
-               milestone: Milestone(osFamily: "iOS 8", device: "iPhone 6")),
-        Anchor(versionID: 813149787, date: day(2015, 9, 16),
-               milestone: Milestone(osFamily: "iOS 9", device: "iPhone 6s")),
-        Anchor(versionID: 818235653, date: day(2016, 9, 8),
-               milestone: Milestone(osFamily: "iOS 10", device: "iPhone 7")),
-        Anchor(versionID: 823376582, date: day(2017, 9, 7),
-               milestone: Milestone(osFamily: "iOS 11", device: "iPhone 8")),
-        Anchor(versionID: 827835179, date: day(2018, 9, 12),
-               milestone: Milestone(osFamily: "iOS 12", device: "iPhone XS")),
-        Anchor(versionID: 832677291, date: day(2019, 9, 11),
-               milestone: Milestone(osFamily: "iOS 13", device: "iPhone 11")),
-        Anchor(versionID: 837795168, date: day(2020, 9, 16),
-               milestone: Milestone(osFamily: "iOS 14", device: "iPad Air 4")),
-        Anchor(versionID: 838141530, date: day(2020, 10, 13),
-               milestone: Milestone(osFamily: "iOS 14", device: "iPhone 12")),
-        Anchor(versionID: 844035757, date: day(2021, 9, 16),
-               milestone: Milestone(osFamily: "iOS 15", device: "iPhone 13")),
-        Anchor(versionID: 852042907, date: day(2022, 9, 8),
-               milestone: Milestone(osFamily: "iOS 16", device: "iPhone 14")),
+        Anchor(versionID: 17191, date: day(2008, 7, 2), osFamily: "iOS 2"),         // iPhone 3G
+        Anchor(versionID: 1804602, date: day(2009, 6, 24), osFamily: "iOS 3"),      // iPhone 3GS
+        Anchor(versionID: 1996524, date: day(2009, 10, 1), osFamily: nil),
+        Anchor(versionID: 2243141, date: day(2010, 2, 11), osFamily: nil),          // iPad，3.2 并入 iOS 3
+        Anchor(versionID: 2479772, date: day(2010, 4, 1), osFamily: nil),
+        Anchor(versionID: 2694492, date: day(2010, 6, 15), osFamily: "iOS 4"),      // iPhone 4
+        Anchor(versionID: 3493095, date: day(2011, 3, 10), osFamily: nil),          // iPad 2，4.3 并入 iOS 4
+        Anchor(versionID: 4375195, date: day(2011, 10, 12), osFamily: "iOS 5"),     // iPhone 4s
+        Anchor(versionID: 6811179, date: day(2012, 3, 7), osFamily: nil),           // iPad 3，5.1 并入 iOS 5
+        Anchor(versionID: 10631785, date: day(2012, 9, 19), osFamily: "iOS 6"),     // iPhone 5
+        Anchor(versionID: 16765251, date: day(2013, 9, 9), osFamily: "iOS 7"),      // iPhone 5s
+        Anchor(versionID: 691954036, date: day(2014, 9, 9), osFamily: "iOS 8"),     // iPhone 6
+        Anchor(versionID: 813149787, date: day(2015, 9, 16), osFamily: "iOS 9"),    // iPhone 6s
+        Anchor(versionID: 818235653, date: day(2016, 9, 8), osFamily: "iOS 10"),    // iPhone 7
+        Anchor(versionID: 823376582, date: day(2017, 9, 7), osFamily: "iOS 11"),    // iPhone 8
+        Anchor(versionID: 827835179, date: day(2018, 9, 12), osFamily: "iOS 12"),   // iPhone XS
+        Anchor(versionID: 832677291, date: day(2019, 9, 11), osFamily: "iOS 13"),   // iPhone 11
+        Anchor(versionID: 837795168, date: day(2020, 9, 16), osFamily: "iOS 14"),   // iPad Air 4
+        Anchor(versionID: 838141530, date: day(2020, 10, 13), osFamily: nil),       // iPhone 12，14.1 并入 iOS 14
+        Anchor(versionID: 844035757, date: day(2021, 9, 16), osFamily: "iOS 15"),   // iPhone 13
+        Anchor(versionID: 852042907, date: day(2022, 9, 8), osFamily: "iOS 16"),    // iPhone 14
     ]
 
-    /// 按系统大版本合并相邻锚点：一代从该版本首个锚点起，到下一个大版本的首个锚点止。
+    /// 每个标了大版本的锚点开启一代，到下一个大版本锚点为止；
+    /// 中间那些只标小版本或纯校准的锚点不会切开窗口。
     static let generations: [CompatibilityGeneration] = {
-        let marked = anchors.compactMap { anchor in
-            anchor.milestone.map { (anchor: anchor, milestone: $0) }
+        let starts = anchors.compactMap { anchor in
+            anchor.osFamily.map { (osFamily: $0, anchor: anchor) }
         }
-
-        // 相邻且同属一个大版本的锚点归为一组。
-        var groups: [(osFamily: String, start: VersionIDTimeline.Anchor, devices: [String])] = []
-        for entry in marked {
-            if var last = groups.last, last.osFamily == entry.milestone.osFamily {
-                last.devices.append(entry.milestone.device)
-                groups[groups.count - 1] = last
-            } else {
-                groups.append((entry.milestone.osFamily, entry.anchor, [entry.milestone.device]))
-            }
-        }
-
-        return groups.indices.map { index in
-            let group = groups[index]
+        return starts.indices.map { index in
+            let entry = starts[index]
             return CompatibilityGeneration(
-                id: group.osFamily,
-                osName: group.osFamily,
-                deviceHint: group.devices.joined(separator: "、"),
-                releaseDate: group.start.date,
-                startVersionID: group.start.versionID,
-                endVersionID: index + 1 < groups.count ? groups[index + 1].start.versionID : Int64.max
+                id: entry.osFamily,
+                osName: entry.osFamily,
+                releaseDate: entry.anchor.date,
+                startVersionID: entry.anchor.versionID,
+                endVersionID: index + 1 < starts.count ? starts[index + 1].anchor.versionID : Int64.max
             )
         }
     }()
