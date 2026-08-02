@@ -1818,6 +1818,8 @@ struct DownloadedItem: Identifiable, Hashable {
     let removesAppStoreUpdates: Bool
     let artworkUrl: String
     let softwarePlatform: String
+    /// 包内 Info.plist 的 MinimumOSVersion。装不装得上由它说了算。
+    let minimumOSVersion: String
 
     var sizeText: String {
         guard sizeBytes > 0 else { return "—" }
@@ -2209,9 +2211,10 @@ enum RightPanelMode: String, CaseIterable, Identifiable {
     case download
     case batch
     case purchases
+    case install
     case logs
 
-    static let allCases: [RightPanelMode] = [.search, .purchases, .batch, .download]
+    static let allCases: [RightPanelMode] = [.search, .purchases, .batch, .download, .install]
 
     var id: String { rawValue }
 
@@ -2227,6 +2230,8 @@ enum RightPanelMode: String, CaseIterable, Identifiable {
             return String(localized: "批量")
         case .purchases:
             return String(localized: "购买记录")
+        case .install:
+            return String(localized: "安装")
         case .logs:
             return String(localized: "日志")
         }
@@ -2244,6 +2249,8 @@ enum RightPanelMode: String, CaseIterable, Identifiable {
             return "square.stack.3d.down.right"
         case .purchases:
             return "bag"
+        case .install:
+            return "iphone.and.arrow.forward"
         case .logs:
             return "terminal"
         }
@@ -2276,6 +2283,9 @@ struct ContentView: View {
     @StateObject private var batchList = BatchListStore()
     @StateObject private var purchaseLibrary = PurchaseLibraryModel()
     @StateObject private var purchaseSync = PurchaseSyncEngine()
+    @StateObject private var deviceManager = DeviceManager()
+    @StateObject private var installQueue = InstallQueue()
+    @AppStorage("installPerfectOnly") private var installPerfectOnly = false
 
     @State private var rightPanel = RightPanelMode.search
     @AppStorage("batchTargetGeneration") private var batchTargetGenerationID = "iOS 9"
@@ -2660,6 +2670,11 @@ struct ContentView: View {
                 PurchaseLibraryWorkspace(model: purchaseLibrary,
                                          sync: purchaseSync,
                                          batchList: batchList)
+            case .install:
+                DeviceInstallWorkspace(devices: deviceManager,
+                                       queue: installQueue,
+                                       library: downloadedItems,
+                                       perfectOnly: $installPerfectOnly)
             case .logs:
                 logsWorkspace
                     .padding(.top, 82)
@@ -5349,6 +5364,11 @@ struct ContentView: View {
                 PurchaseLibraryWorkspace(model: purchaseLibrary,
                                          sync: purchaseSync,
                                          batchList: batchList)
+            case .install:
+                DeviceInstallWorkspace(devices: deviceManager,
+                                       queue: installQueue,
+                                       library: downloadedItems,
+                                       perfectOnly: $installPerfectOnly)
             case .logs:
                 logView
             }
@@ -5408,7 +5428,7 @@ struct ContentView: View {
                 .buttonStyle(.glassProminent)
                 .disabled(batchMatchedCount == 0 || batchIsResolving)
             }
-        case .purchases:
+        case .purchases, .install:
             EmptyView()
         case .logs:
             Button {
@@ -6014,7 +6034,7 @@ struct ContentView: View {
             case .versions:
                 selectAllDownloadedRows()
             }
-        case .batch, .purchases, .logs:
+        case .batch, .purchases, .install, .logs:
             break
         }
     }
@@ -6035,6 +6055,8 @@ struct ContentView: View {
             resolveBatchMatches()
         case .purchases:
             purchaseLibrary.reloadAccounts()
+        case .install:
+            Task { await deviceManager.refresh() }
         case .logs:
             break
         }
@@ -6565,7 +6587,8 @@ struct ContentView: View {
             downloadDate: date,
             removesAppStoreUpdates: metadataInfo.removesAppStoreUpdates || filenameInfo.variant.removesAppStoreUpdates,
             artworkUrl: str("softwareIcon57x57URL"),
-            softwarePlatform: str("software-platform")
+            softwarePlatform: str("software-platform"),
+            minimumOSVersion: infoStr("MinimumOSVersion")
         )
     }
 
