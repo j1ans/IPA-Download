@@ -1658,6 +1658,96 @@ enum VersionIDTimeline {
     static func generation(forVersionID versionID: Int64) -> CompatibilityGeneration? {
         generations.first { $0.contains(versionID: versionID) }
     }
+
+    /// 估算日期的短格式，例如「约 2016-02」。
+    static func approximateDateText(forVersionID versionID: String) -> String? {
+        guard let date = approximateDate(forVersionID: versionID) else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM"
+        return String(localized: "约 \(formatter.string(from: date))")
+    }
+}
+
+/// 批量下载清单里的一条 App。清单只记 App 身份，具体下哪个版本要等选定系统世代后才解析。
+struct BatchListEntry: Identifiable, Codable, Hashable {
+    let id: String
+    var name: String
+    var developer: String
+    var artworkUrl: String
+    var bundleId: String
+    var platform: String
+    var addedAt: Date
+
+    var isVisionApp: Bool {
+        platform.lowercased().contains("vision") || artworkUrl.lowercased().contains(".lsr/")
+    }
+}
+
+extension BatchListEntry {
+    init(app: AppSearchResult) {
+        self.init(id: app.id, name: app.name, developer: app.artistName,
+                  artworkUrl: app.artworkUrl, bundleId: app.bundleId,
+                  platform: app.platform ?? "", addedAt: Date())
+    }
+
+    init(group: DownloadedAppGroup) {
+        self.init(id: group.appId, name: group.appName, developer: group.developer,
+                  artworkUrl: group.artworkUrl, bundleId: group.bundleId,
+                  platform: group.softwarePlatform, addedAt: Date())
+    }
+}
+
+final class BatchListStore: ObservableObject {
+    @Published private(set) var entries: [BatchListEntry] = []
+
+    private let defaultsKey = "batchDownloadList"
+
+    init() {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let decoded = try? JSONDecoder().decode([BatchListEntry].self, from: data)
+        else { return }
+        entries = decoded
+    }
+
+    func contains(_ appID: String) -> Bool {
+        entries.contains { $0.id == appID }
+    }
+
+    func add(_ entry: BatchListEntry) {
+        let appID = entry.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !appID.isEmpty, !contains(appID) else { return }
+        entries.append(entry)
+        persist()
+    }
+
+    func remove(_ appID: String) {
+        guard contains(appID) else { return }
+        entries.removeAll { $0.id == appID }
+        persist()
+    }
+
+    func removeAll() {
+        guard !entries.isEmpty else { return }
+        entries.removeAll()
+        persist()
+    }
+
+    private func persist() {
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        UserDefaults.standard.set(data, forKey: defaultsKey)
+    }
+}
+
+/// 清单里某个 App 针对当前所选系统世代的解析结果。
+enum BatchResolution: Equatable {
+    case idle
+    case loading
+    case matched(VersionRecord)
+    /// 查到了历史版本，但没有一个落在所选世代的窗口里。
+    case noMatch(total: Int)
+    case failed(String)
 }
 
 struct DownloadedItem: Identifiable, Hashable {
@@ -2066,9 +2156,10 @@ enum RightPanelMode: String, CaseIterable, Identifiable {
     case search
     case versions
     case download
+    case batch
     case logs
 
-    static let allCases: [RightPanelMode] = [.search, .download]
+    static let allCases: [RightPanelMode] = [.search, .batch, .download]
 
     var id: String { rawValue }
 
@@ -2080,6 +2171,8 @@ enum RightPanelMode: String, CaseIterable, Identifiable {
             return String(localized: "历史版本")
         case .download:
             return String(localized: "下载")
+        case .batch:
+            return String(localized: "批量")
         case .logs:
             return String(localized: "日志")
         }
@@ -2093,6 +2186,8 @@ enum RightPanelMode: String, CaseIterable, Identifiable {
             return "clock.arrow.circlepath"
         case .download:
             return "arrow.down.circle"
+        case .batch:
+            return "square.stack.3d.down.right"
         case .logs:
             return "terminal"
         }
@@ -2122,8 +2217,13 @@ struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
     @StateObject private var downloads = DownloadManager()
     @StateObject private var catalog = CatalogViewModel()
+    @StateObject private var batchList = BatchListStore()
 
     @State private var rightPanel = RightPanelMode.search
+    @AppStorage("batchTargetGeneration") private var batchTargetGenerationID = "iOS 9"
+    @State private var batchResolutions: [String: BatchResolution] = [:]
+    @State private var batchResolveTask: Task<Void, Never>?
+    @State private var batchMessage = ""
     @State private var glassRefreshToken = 0
     @State private var pendingVerificationCode = ""
     @State private var showingVerificationPrompt = false
@@ -2481,6 +2581,12 @@ struct ContentView: View {
                     .frame(maxWidth: 1220, maxHeight: .infinity)
             case .download:
                 libraryWorkspace
+            case .batch:
+                batchWorkspace
+                    .padding(.top, 82)
+                    .padding(.horizontal, 34)
+                    .padding(.bottom, 30)
+                    .frame(maxWidth: 1220, maxHeight: .infinity)
             case .logs:
                 logsWorkspace
                     .padding(.top, 82)
@@ -3275,6 +3381,8 @@ struct ContentView: View {
             }
 
             Spacer(minLength: 12)
+
+            batchListToggle
 
             historyProviderControl
         }
@@ -4158,6 +4266,338 @@ struct ContentView: View {
         .foregroundStyle(.secondary)
     }
 
+    // MARK: - 批量下载
+
+    private var batchTargetGeneration: CompatibilityGeneration {
+        let generations = VersionIDTimeline.generations
+        return generations.first { $0.id == batchTargetGenerationID } ?? generations[generations.count / 2]
+    }
+
+    private var batchIsResolving: Bool { batchResolveTask != nil }
+
+    private var batchMatchedCount: Int {
+        batchList.entries.reduce(into: 0) { count, entry in
+            if case .matched = batchResolutions[entry.id] { count += 1 }
+        }
+    }
+
+    private var batchWorkspace: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            batchHeader
+
+            if batchList.entries.isEmpty {
+                largeEmptyState(
+                    systemImage: "square.stack.3d.down.right",
+                    title: String(localized: "清单是空的"),
+                    message: String(localized: "在搜索页选中 App 后点「加入清单」，再回到这里一键下载。")
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(batchList.entries) { entry in
+                            batchRow(entry)
+                        }
+                    }
+                    .padding(.bottom, 6)
+                }
+            }
+        }
+        .onChange(of: batchTargetGenerationID) { _, _ in
+            // 换了目标系统，之前解析出的版本就不作数了。
+            batchResolveTask?.cancel()
+            batchResolveTask = nil
+            batchResolutions.removeAll()
+            batchMessage = ""
+        }
+    }
+
+    private var batchHeader: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(String(localized: "批量下载"))
+                    .font(.title2.weight(.semibold))
+                Text(String(localized: "\(batchList.entries.count) 个 App"))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                if !batchList.entries.isEmpty {
+                    Button(String(localized: "清空清单")) { clearBatchList() }
+                        .buttonStyle(.plain)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Text(String(localized: "目标系统"))
+                    .font(.callout.weight(.semibold))
+
+                Picker("", selection: $batchTargetGenerationID) {
+                    ForEach(VersionIDTimeline.generations) { generation in
+                        Text(generation.osName).tag(generation.id)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 120)
+
+                Text(batchGenerationSubtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button {
+                    resolveBatchMatches()
+                } label: {
+                    Label(batchIsResolving ? String(localized: "解析中…") : String(localized: "解析完美兼容版"),
+                          systemImage: "wand.and.stars")
+                }
+                .disabled(batchList.entries.isEmpty || batchIsResolving)
+
+                Button {
+                    startBatchDownloads()
+                } label: {
+                    Label(String(localized: "一键下载 \(batchMatchedCount) 个"), systemImage: "arrow.down.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(batchMatchedCount == 0 || batchIsResolving)
+            }
+
+            if !batchMessage.isEmpty {
+                Text(batchMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var batchGenerationSubtitle: String {
+        let generation = batchTargetGeneration
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd"
+        let upper = generation.endVersionID == Int64.max ? "…" : String(generation.endVersionID)
+        return String(localized: "\(formatter.string(from: generation.releaseDate)) 起 · 版本 ID \(generation.startVersionID)–\(upper)")
+    }
+
+    private func batchRow(_ entry: BatchListEntry) -> some View {
+        HStack(spacing: 12) {
+            CachedRemoteAppIcon(urlString: entry.artworkUrl,
+                                size: 40,
+                                cornerRadius: entry.isVisionApp ? 20 : 10,
+                                cache: $remoteAppIcons)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(entry.name)
+                    .font(.body.weight(.medium))
+                    .lineLimit(1)
+                Text(entry.developer.isEmpty ? "App ID \(entry.id)" : entry.developer)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 10)
+
+            batchResolutionLabel(for: entry)
+
+            Button {
+                batchList.remove(entry.id)
+                batchResolutions[entry.id] = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.tertiary)
+            }
+            .buttonStyle(.plain)
+            .help(String(localized: "从清单移除"))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(manualVersionBarFill)
+        }
+    }
+
+    @ViewBuilder
+    private func batchResolutionLabel(for entry: BatchListEntry) -> some View {
+        switch batchResolutions[entry.id] ?? .idle {
+        case .idle:
+            Text(String(localized: "待解析"))
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        case .loading:
+            ProgressView()
+                .controlSize(.small)
+        case .matched(let record):
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("v\(record.version)")
+                    .font(.callout.weight(.medium))
+                Text(VersionIDTimeline.approximateDateText(forVersionID: record.versionId) ?? record.versionId)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        case .noMatch(let total):
+            Text(String(localized: "\(total) 个版本中无匹配"))
+                .font(.caption)
+                .foregroundStyle(.orange)
+        case .failed(let message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .lineLimit(1)
+        }
+    }
+
+    private func resolveBatchMatches() {
+        batchResolveTask?.cancel()
+        let entries = batchList.entries
+        guard !entries.isEmpty else { return }
+
+        let generation = batchTargetGeneration
+        batchMessage = ""
+        for entry in entries { batchResolutions[entry.id] = .loading }
+
+        batchResolveTask = Task { @MainActor in
+            defer { batchResolveTask = nil }
+
+            // 每次查询都要起一个 node 进程，限制并发，别把本机和 Apple 一起打爆。
+            let concurrency = min(3, entries.count)
+            var next = 0
+            await withTaskGroup(of: (String, BatchResolution).self) { group in
+                func enqueue() {
+                    guard next < entries.count else { return }
+                    let entry = entries[next]
+                    next += 1
+                    group.addTask { await Self.resolveBatchEntry(entry, generation: generation) }
+                }
+                for _ in 0..<concurrency { enqueue() }
+                while let (appID, resolution) = await group.next() {
+                    guard !Task.isCancelled else {
+                        group.cancelAll()
+                        break
+                    }
+                    batchResolutions[appID] = resolution
+                    enqueue()
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+            batchMessage = String(localized: "已解析：\(batchMatchedCount) 个 App 找到 \(generation.osName) 的完美兼容版。")
+        }
+    }
+
+    private static func resolveBatchEntry(_ entry: BatchListEntry,
+                                          generation: CompatibilityGeneration) async -> (String, BatchResolution) {
+        do {
+            let data = try await NodeRuntime.runJSON(arguments: [
+                "main.js", "versions",
+                "--id", entry.id,
+                "--provider", "auto"
+            ], timeout: 90)
+            let response = try JSONDecoder().decode(VersionsResponse.self, from: data)
+            if let match = generation.perfectMatch(among: response.versions) {
+                return (entry.id, .matched(match))
+            }
+            return (entry.id, .noMatch(total: response.versions.count))
+        } catch {
+            return (entry.id, .failed(nodeQueryErrorMessage(error)))
+        }
+    }
+
+    private func startBatchDownloads() {
+        guard let credentials = resolveDownloadCredentials() else { return }
+
+        var started = 0
+        for entry in batchList.entries {
+            guard case .matched(let record) = batchResolutions[entry.id] else { continue }
+            let jobID = "batch-\(entry.id)-\(record.versionId)"
+            guard !downloads.isRunning(jobID) else { continue }
+
+            let config = RunConfig(
+                appleAccount: credentials.appleAccount,
+                password: credentials.password,
+                code: "",
+                appID: entry.id,
+                versionID: record.versionId,
+                downloadDir: credentials.downloadDir
+            )
+            downloads.start(id: jobID, label: "\(entry.name) \(record.version)", config: config)
+            started += 1
+        }
+
+        batchMessage = started == 0
+            ? String(localized: "没有可开始的下载任务。")
+            : String(localized: "已开始 \(started) 个下载任务，进度见「下载」。")
+    }
+
+    private func clearBatchList() {
+        batchResolveTask?.cancel()
+        batchResolveTask = nil
+        batchList.removeAll()
+        batchResolutions.removeAll()
+        batchMessage = ""
+    }
+
+    private struct DownloadCredentials {
+        let appleAccount: String
+        let password: String
+        let downloadDir: String
+    }
+
+    private func resolveDownloadCredentials() -> DownloadCredentials? {
+        guard let account = accountStore.selectedAccount else {
+            saveMessage = String(localized: "请先登录 Apple 账户。")
+            showSettings()
+            return nil
+        }
+        let appleAccount = account.appleAccount.trimmingCharacters(in: .whitespacesAndNewlines)
+        let password: String
+        do {
+            password = try accountStore.password(for: account)
+        } catch {
+            saveMessage = error.localizedDescription
+            return nil
+        }
+        guard !appleAccount.isEmpty, !password.isEmpty else {
+            saveMessage = String(localized: "请先登录 Apple 账户。")
+            showSettings()
+            return nil
+        }
+        let dir = downloadDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !dir.isEmpty else {
+            batchMessage = String(localized: "请先在设置中选择保存目录。")
+            return nil
+        }
+        return DownloadCredentials(appleAccount: appleAccount, password: password, downloadDir: dir)
+    }
+
+    @ViewBuilder
+    private var batchListToggle: some View {
+        if let app = selectedApp {
+            let inList = batchList.contains(app.id)
+            Button {
+                if inList {
+                    batchList.remove(app.id)
+                    batchResolutions[app.id] = nil
+                } else {
+                    batchList.add(BatchListEntry(app: app))
+                }
+            } label: {
+                Label(inList ? String(localized: "已在清单") : String(localized: "加入清单"),
+                      systemImage: inList ? "checkmark.circle.fill" : "plus.circle")
+                    .font(.callout)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(inList ? Color.accentColor : Color.secondary)
+            .help(inList ? String(localized: "从批量清单移除") : String(localized: "加入批量清单"))
+        }
+    }
+
     private var logsWorkspace: some View {
         VStack(alignment: .leading, spacing: 18) {
             workspaceHeader(
@@ -4260,6 +4700,9 @@ struct ContentView: View {
                 versionsView
             case .download:
                 downloadWorkspace
+            case .batch:
+                batchWorkspace
+                    .padding(20)
             case .logs:
                 logView
             }
@@ -4300,6 +4743,15 @@ struct ContentView: View {
             .controlSize(.large)
             .buttonStyle(.glassProminent)
             .disabled((selectedDownloadJobID().map { downloads.isRunning($0) } ?? false) || activeAppID.isEmpty || selectedVersion == nil)
+        case .batch:
+            Button {
+                startBatchDownloads()
+            } label: {
+                Label(String(localized: "一键下载"), systemImage: "arrow.down.circle.fill")
+            }
+            .controlSize(.large)
+            .buttonStyle(.glassProminent)
+            .disabled(batchMatchedCount == 0 || batchIsResolving)
         case .logs:
             Button {
                 downloads.clearFinished()
@@ -4904,7 +5356,7 @@ struct ContentView: View {
             case .versions:
                 selectAllDownloadedRows()
             }
-        case .logs:
+        case .batch, .logs:
             break
         }
     }
@@ -4921,6 +5373,8 @@ struct ContentView: View {
             } else {
                 catalog.search()
             }
+        case .batch:
+            resolveBatchMatches()
         case .logs:
             break
         }
