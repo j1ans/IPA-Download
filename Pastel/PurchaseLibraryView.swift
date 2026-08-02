@@ -274,6 +274,9 @@ struct PurchaseLibraryWorkspace: View {
 
     private var accountSidebar: some View {
         VStack(spacing: 0) {
+            // 顶部浮动标签栏会盖住这一段，留出它的高度。
+            Color.clear.frame(height: 54)
+
             List(selection: Binding(
                 get: { model.selectedDsid },
                 set: { newValue in
@@ -331,6 +334,7 @@ struct PurchaseLibraryWorkspace: View {
             }
             .padding(12)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: 右侧：App 列表
@@ -396,13 +400,33 @@ struct PurchaseLibraryWorkspace: View {
                 .disabled(model.totalCount == 0 || isAddingAll)
             }
 
-            TextField(String(localized: "搜索名称、开发者或 App ID"), text: $model.searchText)
-                .textFieldStyle(.roundedBorder)
-                .onSubmit { model.reloadRows() }
-                .onChange(of: model.searchText) { _, _ in model.reloadRows() }
+            HStack(spacing: 7) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+
+                TextField(String(localized: "搜索名称、开发者或 App ID"), text: $model.searchText)
+                    .textFieldStyle(.plain)
+                    .onSubmit { model.reloadRows() }
+                    .onChange(of: model.searchText) { _, _ in model.reloadRows() }
+
+                if !model.searchText.isEmpty {
+                    Button {
+                        model.searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.secondary.opacity(0.1))
+            }
         }
         .padding(.horizontal, 16)
-        .padding(.top, 14)
+        .padding(.top, 62)
         .padding(.bottom, 10)
     }
 

@@ -1777,6 +1777,11 @@ enum BatchResolution: Equatable {
     case matched(BatchCandidates)
     /// 查到了历史版本，但没有一个落在所选世代的窗口里。
     case noMatch(total: Int)
+    /// 任何来源都查不到版本历史 —— 绝版 App 的典型症状。
+    /// 需要先下一个最新版，再从包内 iTunesMetadata.plist 反推出完整的历史版本 ID。
+    case needsProbe
+    /// 正在下最新版做探测。
+    case probing
     case failed(String)
 }
 
@@ -2266,6 +2271,8 @@ struct ContentView: View {
     @State private var batchActiveEntryID: String?
     @State private var batchAttempts: [String: Int] = [:]
     @State private var batchFailures: [String: String] = [:]
+    /// 正在下最新版做历史版本探测的 App，值是探测开始时间（用来认领刚下好的文件）。
+    @State private var batchProbeStartedAt: [String: Date] = [:]
     @State private var glassRefreshToken = 0
     @State private var pendingVerificationCode = ""
     @State private var showingVerificationPrompt = false
@@ -2630,10 +2637,11 @@ struct ContentView: View {
                     .padding(.bottom, 30)
                     .frame(maxWidth: 1220, maxHeight: .infinity)
             case .purchases:
+                // 和搜索/下载页一样铺满窗口，顶部的浮动标签栏浮在上层；
+                // 之前在外层留 62pt 顶部内边距，等于把整个分栏视图连同侧栏一起压矮了。
                 PurchaseLibraryWorkspace(model: purchaseLibrary,
                                          sync: purchaseSync,
                                          batchList: batchList)
-                    .padding(.top, 62)
             case .logs:
                 logsWorkspace
                     .padding(.top, 82)
@@ -4322,10 +4330,20 @@ struct ContentView: View {
 
     private var batchIsResolving: Bool { batchResolveTask != nil }
 
+    /// 可以开始下载的条目：已选出版本的，加上待探测的绝版 App。
     private var batchMatchedCount: Int {
         batchList.entries.reduce(into: 0) { count, entry in
-            if case .matched = batchResolutions[entry.id] { count += 1 }
+            switch batchResolutions[entry.id] {
+            case .matched, .needsProbe: count += 1
+            default: break
+            }
         }
+    }
+
+    /// plist 反推出来的版本只有 ID、没有版本号，退而用估算日期标识。
+    private func batchVersionLabel(_ record: VersionRecord) -> String {
+        if !record.version.isEmpty { return "v\(record.version)" }
+        return VersionIDTimeline.approximateDateText(forVersionID: record.versionId) ?? record.versionId
     }
 
     private var batchWorkspace: some View {
@@ -4576,10 +4594,15 @@ struct ContentView: View {
 
     /// 已解析出版本的条目才有对应的下载任务。退档重试后版本变了，任务 ID 也随之变。
     private func batchJobID(for entry: BatchListEntry) -> String? {
-        guard case .matched(let candidates) = batchResolutions[entry.id],
-              let record = candidates.current
-        else { return nil }
-        return "batch-\(entry.id)-\(record.versionId)"
+        switch batchResolutions[entry.id] {
+        case .matched(let candidates):
+            guard let record = candidates.current else { return nil }
+            return "batch-\(entry.id)-\(record.versionId)"
+        case .probing:
+            return "batch-probe-\(entry.id)"
+        default:
+            return nil
+        }
     }
 
     /// 有任务在跑就把版本号和进度并排显示，让人一眼看出「哪个 App 的哪个版本下到几成」。
@@ -4629,7 +4652,7 @@ struct ContentView: View {
                             .foregroundStyle(.orange)
                             .help(String(localized: "首选版本下载失败，已退到第 \(candidates.index + 1) 接近的版本"))
                     }
-                    Text("v\(candidates.current?.version ?? "")")
+                    Text(candidates.current.map { batchVersionLabel($0) } ?? "")
                         .font(.callout.weight(.medium))
                 }
                 if let failure = batchFailures[entry.id] {
@@ -4645,8 +4668,22 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+        case .needsProbe:
+            Label(String(localized: "绝版 · 待探测"), systemImage: "questionmark.circle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .help(String(localized: "各来源都查不到版本历史。下载时会先取一份最新版，再从包内读出完整的历史版本 ID。"))
+        case .probing:
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.small)
+                Text(String(localized: "探测中"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         case .noMatch(let total):
-            Text(String(localized: "\(total) 个版本中无匹配"))
+            Text(total == 0
+                 ? String(localized: "查不到版本历史")
+                 : String(localized: "\(total) 个版本中无匹配"))
                 .font(.caption)
                 .foregroundStyle(.orange)
         case .failed(let message):
@@ -4704,6 +4741,11 @@ struct ContentView: View {
                 "--provider", "auto"
             ], timeout: 90)
             let response = try JSONDecoder().decode(VersionsResponse.self, from: data)
+            // 一个版本都查不到，多半是 App 已下架，第三方源根本没有它的记录。
+            // 这种情况留给探测流程：下一个最新版，从包里把历史版本 ID 捞回来。
+            if response.versions.isEmpty {
+                return (entry.id, .needsProbe)
+            }
             let ranked = generation.rankedMatches(among: response.versions)
             if ranked.isEmpty {
                 return (entry.id, .noMatch(total: response.versions.count))
@@ -4711,6 +4753,20 @@ struct ContentView: View {
             return (entry.id, .matched(BatchCandidates(records: ranked)))
         } catch {
             return (entry.id, .failed(nodeQueryErrorMessage(error)))
+        }
+    }
+
+    /// 用包内的历史版本 ID 清单合成版本记录。
+    /// 只有 ID 没有版本号 —— 但完美兼容版的判定本来就只看版本 ID 落在哪个世代窗口，
+    /// 版本号缺失不影响挑选，界面改用估算日期来标识。
+    private static func syntheticRecords(appID: String, versionIDs: [String]) -> [VersionRecord] {
+        versionIDs.map { versionID in
+            VersionRecord(id: "plist-\(appID)-\(versionID)",
+                          version: "",
+                          versionId: versionID,
+                          date: "",
+                          size: "",
+                          source: "plist")
         }
     }
 
@@ -4727,8 +4783,10 @@ struct ContentView: View {
         guard resolveDownloadCredentials() != nil else { return }
 
         let pending = batchList.entries.compactMap { entry -> String? in
-            guard case .matched = batchResolutions[entry.id] else { return nil }
-            return entry.id
+            switch batchResolutions[entry.id] {
+            case .matched, .needsProbe: return entry.id
+            default: return nil
+            }
         }
         guard !pending.isEmpty else {
             batchMessage = String(localized: "没有可开始的下载任务。")
@@ -4764,23 +4822,37 @@ struct ContentView: View {
 
         while !batchQueue.isEmpty {
             let entryID = batchQueue.removeFirst()
-            guard let entry = batchList.entries.first(where: { $0.id == entryID }),
-                  case .matched(let candidates) = batchResolutions[entryID],
-                  let record = candidates.current,
-                  let jobID = batchJobID(for: entry),
-                  !downloads.isRunning(jobID)
-            else { continue }
+            guard let entry = batchList.entries.first(where: { $0.id == entryID }) else { continue }
+
+            let versionID: String
+            let label: String
+            switch batchResolutions[entryID] {
+            case .matched(let candidates):
+                guard let record = candidates.current else { continue }
+                versionID = record.versionId
+                label = "\(entry.name) \(batchVersionLabel(record))"
+            case .needsProbe:
+                // 绝版 App：版本号留空即下最新版，下完从包内 plist 反推历史版本 ID。
+                batchResolutions[entryID] = .probing
+                batchProbeStartedAt[entryID] = Date()
+                versionID = ""
+                label = "\(entry.name) · \(String(localized: "探测历史版本"))"
+            default:
+                continue
+            }
+
+            guard let jobID = batchJobID(for: entry), !downloads.isRunning(jobID) else { continue }
 
             let config = RunConfig(
                 appleAccount: credentials.appleAccount,
                 password: credentials.password,
                 code: "",
                 appID: entry.id,
-                versionID: record.versionId,
+                versionID: versionID,
                 downloadDir: credentials.downloadDir
             )
             batchActiveEntryID = entryID
-            downloads.start(id: jobID, label: "\(entry.name) \(record.version)", config: config)
+            downloads.start(id: jobID, label: label, config: config)
             return
         }
 
@@ -4818,11 +4890,75 @@ struct ContentView: View {
             break
         case .done:
             batchFailures[entryID] = nil
-            batchActiveEntryID = nil
-            startNextBatchDownload()
+            if case .probing = batchResolutions[entryID] {
+                completeBatchProbe(for: entryID)
+            } else {
+                batchActiveEntryID = nil
+                startNextBatchDownload()
+            }
         case .failed:
             handleBatchFailure(for: entryID, log: job.log)
         }
+    }
+
+    /// 探测下载完成：从刚下好的包里读出全部历史版本 ID，据此选出完美兼容版。
+    private func completeBatchProbe(for entryID: String) {
+        batchActiveEntryID = nil
+        let startedAt = batchProbeStartedAt.removeValue(forKey: entryID) ?? .distantPast
+
+        guard let url = newestIPA(forAppID: entryID, after: startedAt) else {
+            batchResolutions[entryID] = .failed(String(localized: "找不到刚下载的文件，无法读取历史版本。"))
+            startNextBatchDownload()
+            return
+        }
+
+        let versionIDs = Self.historicalVersionIDs(fromIPA: url.path)
+        guard !versionIDs.isEmpty else {
+            batchResolutions[entryID] = .noMatch(total: 0)
+            startNextBatchDownload()
+            return
+        }
+
+        let records = Self.syntheticRecords(appID: entryID, versionIDs: versionIDs)
+        let ranked = batchTargetGeneration.rankedMatches(among: records)
+        guard !ranked.isEmpty else {
+            batchResolutions[entryID] = .noMatch(total: records.count)
+            startNextBatchDownload()
+            return
+        }
+
+        batchResolutions[entryID] = .matched(BatchCandidates(records: ranked))
+        // 刚下的是最新版，通常不是目标世代那一版；排回队首再下一次真正要的版本。
+        let downloadedID = Self.extractVersionMetadata(fromIPA: url.path).versionID
+        if ranked.first?.versionId != downloadedID {
+            batchQueue.insert(entryID, at: 0)
+        }
+        refreshDownloadedFiles()
+        startNextBatchDownload()
+    }
+
+    /// 在下载目录里认领探测刚产出的那个包。
+    /// 不走 downloadedItems 是因为它由后台防抖刷新，这一刻还不一定包含新文件。
+    private func newestIPA(forAppID appID: String, after startedAt: Date) -> URL? {
+        let dir = downloadDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !dir.isEmpty else { return nil }
+        let root = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath, isDirectory: true)
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
+        ) else { return nil }
+
+        return entries
+            .filter { $0.pathExtension.lowercased() == "ipa" }
+            .compactMap { candidate -> (url: URL, date: Date)? in
+                guard let date = (try? candidate.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate,
+                    date >= startedAt.addingTimeInterval(-5)
+                else { return nil }
+                return (candidate, date)
+            }
+            .sorted { $0.date > $1.date }
+            .first { Self.extractDownloadedItem(fromIPA: $0.url)?.appId == appID }?
+            .url
     }
 
     /// 某个版本没下下来：只要不是账户层面的问题，就退到本世代里次接近的版本再试。
@@ -6341,6 +6477,26 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    /// 从下载好的 IPA 里取回该 App 的全部历史版本 ID。
+    ///
+    /// 绝版 App 在第三方版本源里查不到，但 Apple 在 iTunesMetadata.plist 里附了
+    /// `softwareVersionExternalIdentifiers` —— 一份完整的历史版本 ID 清单。实测 QQ 的包里
+    /// 有 325 个，比第三方源给出的 305 个还全。所以只要能下到任意一个版本（版本号留空即
+    /// 下最新版），就能反推出这个 App 的全部历史版本。
+    private static func historicalVersionIDs(fromIPA path: String) -> [String] {
+        let info = downloadedMetadata(fromIPA: path)
+        guard let data = info.data,
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
+        else { return [] }
+        if let numbers = plist["softwareVersionExternalIdentifiers"] as? [NSNumber] {
+            return numbers.map(\.stringValue)
+        }
+        if let strings = plist["softwareVersionExternalIdentifiers"] as? [String] {
+            return strings
+        }
+        return []
     }
 
     private static func extractVersionMetadata(fromIPA path: String) -> (versionID: String?, variant: IPADownloadVariant) {
