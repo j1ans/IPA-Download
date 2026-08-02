@@ -4980,13 +4980,20 @@ struct ContentView: View {
             baseStem = stem
         }
 
+        // 引擎在 Apple 元数据缺字段时写入这两个占位名，等同于「未知」，不能当成真实值用。
+        func realValue(_ value: String, placeholder: String) -> String {
+            value.caseInsensitiveCompare(placeholder) == .orderedSame ? "" : value
+        }
+
         guard let underscore = baseStem.lastIndex(of: "_") else {
-            return (baseStem, "", variant)
+            return (realValue(baseStem, placeholder: "UnknownApp"), "", variant)
         }
 
         let name = String(baseStem[..<underscore])
         let version = String(baseStem[baseStem.index(after: underscore)...])
-        return (name, version, variant)
+        return (realValue(name, placeholder: "UnknownApp"),
+                realValue(version, placeholder: "UnknownVer"),
+                variant)
     }
 
     private func fetchVersionIDsFromApple(allowAppAcquisition: Bool = false) {
@@ -5221,6 +5228,13 @@ struct ContentView: View {
             }
             if let item = extractDownloadedItem(fromIPA: url) {
                 items.append(item)
+                // 文件名未必带真实版本号，用解析出的版本再登记一个键，
+                // 让老 App 也能在版本列表里正确标记为「已下载」。
+                if !item.version.isEmpty {
+                    let variant = IPADownloadVariant(removeAppStoreUpdateMetadata: item.removesAppStoreUpdates)
+                    let key = downloadedFileKey(item.version, variant: variant)
+                    if filesByVersion[key] == nil { filesByVersion[key] = url }
+                }
             }
         }
 
@@ -5240,15 +5254,10 @@ struct ContentView: View {
         let filenameInfo = filenameVersionAndVariant(from: stem)
 
         let metadataInfo = downloadedMetadata(fromIPA: path)
-        guard let data = metadataInfo.data,
-              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
-        else {
-            let name = filenameInfo.name.isEmpty ? stem : filenameInfo.name
-            return DownloadedItem(id: path, fileURL: url, appName: name, developer: "", bundleId: "",
-                                  appId: "", groupKey: name, version: filenameInfo.version, versionId: "", sizeBytes: size,
-                                  appleAccount: "", storefrontId: "", downloadDate: date,
-                                  removesAppStoreUpdates: filenameInfo.variant.removesAppStoreUpdates,
-                                  artworkUrl: "", softwarePlatform: "")
+        var plist: [String: Any] = [:]
+        if let data = metadataInfo.data,
+           let parsed = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] {
+            plist = parsed
         }
 
         func str(_ key: String) -> String {
@@ -5256,12 +5265,34 @@ struct ContentView: View {
             if let n = plist[key] as? NSNumber { return n.stringValue }
             return ""
         }
-        let appName = !str("itemName").isEmpty ? str("itemName")
-            : (!str("bundleDisplayName").isEmpty ? str("bundleDisplayName") : stem)
+
+        var appName = !str("itemName").isEmpty ? str("itemName") : str("bundleDisplayName")
+        var bundleId = str("softwareVersionBundleId")
+        var version = str("bundleShortVersionString")
+
+        // Apple 元数据缺版本（老 App 常见），或整包没有元数据（第三方 / 脱壳 IPA）时，
+        // 回落到 App 自身的 Info.plist 取真实值。字段齐全就不读，避免多一次解压。
+        if version.isEmpty || bundleId.isEmpty || appName.isEmpty {
+            let info = appInfoPlist(fromIPA: path) ?? [:]
+            func infoStr(_ key: String) -> String {
+                if let s = info[key] as? String { return s }
+                if let n = info[key] as? NSNumber { return n.stringValue }
+                return ""
+            }
+            if version.isEmpty { version = infoStr("CFBundleShortVersionString") }
+            if version.isEmpty { version = str("bundleVersion") }
+            if version.isEmpty { version = infoStr("CFBundleVersion") }
+            if bundleId.isEmpty { bundleId = infoStr("CFBundleIdentifier") }
+            if appName.isEmpty { appName = infoStr("CFBundleDisplayName") }
+            if appName.isEmpty { appName = infoStr("CFBundleName") }
+        }
+
+        // 文件名只是最后的猜测：它取最后一个下划线之后的片段，未必是真实版本号。
+        if version.isEmpty { version = filenameInfo.version }
+        if appName.isEmpty { appName = filenameInfo.name.isEmpty ? stem : filenameInfo.name }
+
         let itemId = str("itemId")
-        let bundleId = str("softwareVersionBundleId")
         let groupKey = !itemId.isEmpty ? itemId : (!bundleId.isEmpty ? bundleId : appName)
-        let version = !str("bundleShortVersionString").isEmpty ? str("bundleShortVersionString") : filenameInfo.version
 
         return DownloadedItem(
             id: path,
