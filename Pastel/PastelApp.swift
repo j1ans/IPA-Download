@@ -5418,21 +5418,134 @@ struct ContentView: View {
         return (nil, false)
     }
 
-    private static func extractAppIcon(fromIPA path: String) -> NSImage? {
-        guard let listData = runUnzip(["-Z1", path]),
-              let list = String(data: listData, encoding: .utf8) else { return nil }
-        let entries = list.split(separator: "\n").map(String.init)
-        let icons = entries.filter { entry in
-            let lower = entry.lowercased()
-            return lower.hasSuffix(".png")
-                && lower.range(of: #"payload/[^/]+\.app/[^/]*appicon[^/]*\.png$"#, options: .regularExpression) != nil
+    // unzip 把文件名参数当通配符解析，条目名里的 [ ? * 需要转义才能精确取出。
+    private static func zipEscape(_ name: String) -> String {
+        var escaped = ""
+        for ch in name {
+            if ch == "*" || ch == "?" || ch == "[" || ch == "\\" { escaped.append("\\") }
+            escaped.append(ch)
         }
-        guard !icons.isEmpty else { return nil }
-        let chosen = icons.first { $0.lowercased().contains("60x60@2x") }
-            ?? icons.first { $0.lowercased().contains("@2x") }
-            ?? icons[0]
-        guard let pngData = runUnzip(["-p", path, chosen]) else { return nil }
-        return NSImage(data: pngData)
+        return escaped
+    }
+
+    private static func zipEntries(fromIPA path: String) -> [String] {
+        guard let listData = runUnzip(["-Z1", path]),
+              let list = String(data: listData, encoding: .utf8) else { return [] }
+        return list.split(separator: "\n").map(String.init)
+    }
+
+    // Payload/<App>.app/Info.plist：老 App 的图标名与版本号都要靠它兜底。
+    private static func appInfoPlist(fromIPA path: String, entries: [String]? = nil) -> [String: Any]? {
+        let list = entries ?? zipEntries(fromIPA: path)
+        guard let entry = list.first(where: {
+                  $0.range(of: #"^Payload/[^/]+\.app/Info\.plist$"#,
+                           options: [.regularExpression, .caseInsensitive]) != nil
+              }),
+              let data = runUnzip(["-p", path, zipEscape(entry)]),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
+        else { return nil }
+        return plist
+    }
+
+    // 图标声明历经三代：CFBundleIcons（iOS 5+）、CFBundleIconFiles（iOS 3.2+）、CFBundleIconFile（iOS 2）。
+    private static func declaredIconNames(in info: [String: Any]) -> [String] {
+        var names: [String] = []
+        func append(_ value: Any?) {
+            if let list = value as? [String] {
+                names.append(contentsOf: list)
+            } else if let single = value as? String {
+                names.append(single)
+            }
+        }
+        for key in ["CFBundleIcons", "CFBundleIcons~ipad"] {
+            guard let icons = info[key] as? [String: Any] else { continue }
+            if let primary = icons["CFBundlePrimaryIcon"] as? [String: Any] {
+                append(primary["CFBundleIconFiles"])
+                append(primary["CFBundleIconName"])
+            } else {
+                append(icons["CFBundlePrimaryIcon"])
+            }
+        }
+        append(info["CFBundleIconFiles"])
+        append(info["CFBundleIconFiles~ipad"])
+        append(info["CFBundleIconFile"])
+        return names
+    }
+
+    private static func iconBaseName(of entry: String) -> String {
+        var base = (entry as NSString).lastPathComponent.lowercased()
+        if base.hasSuffix(".png") { base.removeLast(4) }
+        return base
+    }
+
+    // 声明名可以省略扩展名与倍率/设备后缀：Icon → Icon.png、Icon@2x.png、Icon~ipad.png。
+    private static func iconEntry(_ entry: String, matches declared: String) -> Bool {
+        var name = declared.lowercased()
+        if name.hasSuffix(".png") { name.removeLast(4) }
+        guard !name.isEmpty else { return false }
+        let base = iconBaseName(of: entry)
+        return base == name || base.hasPrefix(name + "@") || base.hasPrefix(name + "~")
+    }
+
+    // 由文件名推算像素边长：AppIcon60x60@2x → 120、Icon-72 → 72、Icon@2x → 114。
+    private static func iconPixelSize(_ entry: String) -> Int {
+        let base = iconBaseName(of: entry)
+        let scale = base.contains("@3x") ? 3 : (base.contains("@2x") ? 2 : 1)
+        var points = 57  // iOS 2/3 时代 Icon.png 的固定尺寸
+        if let range = base.range(of: #"\d+x\d+"#, options: .regularExpression) {
+            points = Int(base[range].prefix { $0.isNumber }) ?? points
+        } else if let range = base.range(of: #"-\d+(@\dx)?$"#, options: .regularExpression) {
+            points = Int(base[range].dropFirst().prefix { $0.isNumber }) ?? points
+        }
+        return points * scale
+    }
+
+    // 优先取「不小于 120px 中最小的那张」：显示够清晰，又不会把 1024px 大图常驻内存。
+    private static func orderedIconCandidates(_ candidates: [String]) -> [String] {
+        let scored = candidates.map { ($0, iconPixelSize($0)) }
+        let sharp = scored.filter { $0.1 >= 120 }.sorted { $0.1 < $1.1 }
+        let rest = scored.sorted { $0.1 > $1.1 }
+        var ordered: [String] = []
+        for entry in sharp.map(\.0) + rest.map(\.0) where !ordered.contains(entry) {
+            ordered.append(entry)
+        }
+        return ordered
+    }
+
+    private static func extractAppIcon(fromIPA path: String) -> NSImage? {
+        let entries = zipEntries(fromIPA: path)
+        guard !entries.isEmpty else { return nil }
+
+        let rootPNGs = entries.filter {
+            $0.range(of: #"^Payload/[^/]+\.app/[^/]+\.png$"#,
+                     options: [.regularExpression, .caseInsensitive]) != nil
+        }
+        guard !rootPNGs.isEmpty else { return nil }
+
+        // 现代 App：资源目录导出的 AppIcon*.png
+        var candidates = rootPNGs.filter { $0.lowercased().contains("appicon") }
+
+        // 老 App 不用 AppIcon 命名，改按 Info.plist 声明的图标名匹配
+        if candidates.isEmpty, let info = appInfoPlist(fromIPA: path, entries: entries) {
+            let declared = declaredIconNames(in: info)
+            candidates = rootPNGs.filter { entry in
+                declared.contains { iconEntry(entry, matches: $0) }
+            }
+        }
+
+        // 最后兜底：Info.plist 未声明时按 Icon.png / Icon@2x.png 的约定命名找
+        if candidates.isEmpty {
+            candidates = rootPNGs.filter { iconBaseName(of: $0).hasPrefix("icon") }
+        }
+        guard !candidates.isEmpty else { return nil }
+
+        for entry in orderedIconCandidates(candidates).prefix(4) {
+            if let pngData = runUnzip(["-p", path, zipEscape(entry)]),
+               let image = NSImage(data: pngData) {
+                return image
+            }
+        }
+        return nil
     }
 
     private func revealInFinder(_ url: URL) {
