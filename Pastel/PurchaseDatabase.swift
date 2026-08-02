@@ -196,6 +196,31 @@ final class PurchaseDatabase {
         try execute("CREATE INDEX IF NOT EXISTS idx_line_items_lookup ON line_items(dsid, line_item_type, adam_id);")
         try execute("CREATE INDEX IF NOT EXISTS idx_line_items_date ON line_items(dsid, line_item_type, pli_date);")
         try execute("CREATE INDEX IF NOT EXISTS idx_line_items_adam ON line_items(adam_id);")
+        // 聚合重算时按 (账户, App, 时间) 连回最新那行，靠这条索引避免逐组排序。
+        try execute("CREATE INDEX IF NOT EXISTS idx_line_items_latest ON line_items(dsid, adam_id, pli_date);")
+        // 按 App 聚合的结果物化成表。
+        //
+        // 直接在 line_items 上 GROUP BY 翻页，代价与账户总量成正比而不是页大小：
+        // 实测 5 万个 App 时首页要 890ms、中段翻页 371ms，滚动根本跟不上。物化之后
+        // 排序键进了索引，翻页退化成索引扫描，与总量无关。
+        //
+        // 计数不是累加而是每次从 line_items 重算，所以重复同步依然幂等。
+        try execute("""
+            CREATE TABLE IF NOT EXISTS purchased_apps (
+                dsid           TEXT NOT NULL,
+                adam_id        TEXT NOT NULL,
+                first_date     TEXT NOT NULL DEFAULT '',
+                last_date      TEXT NOT NULL DEFAULT '',
+                purchase_count INTEGER NOT NULL DEFAULT 0,
+                name           TEXT NOT NULL DEFAULT '',
+                developer      TEXT NOT NULL DEFAULT '',
+                artwork_url    TEXT NOT NULL DEFAULT '',
+                storefront_id  TEXT NOT NULL DEFAULT '',
+                is_free        INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (dsid, adam_id)
+            );
+            """)
+        try execute("CREATE INDEX IF NOT EXISTS idx_apps_order ON purchased_apps(dsid, first_date, adam_id);")
         try execute("""
             CREATE TABLE IF NOT EXISTS accounts (
                 dsid            TEXT PRIMARY KEY,
@@ -256,12 +281,74 @@ final class PurchaseDatabase {
                         throw DatabaseError.statement(lastErrorMessage())
                     }
                 }
+                try refreshAggregate(for: items)
                 try executeRaw("COMMIT;")
                 return items.count
             } catch {
                 try? executeRaw("ROLLBACK;")
                 throw error
             }
+        }
+    }
+
+    /// 重算受影响 App 的聚合行。
+    ///
+    /// 一次同步只碰十几个 App 时逐个点查最快；首次全量导入一次会带进几万个，那时
+    /// 单条语句整账户重算反而更划算 —— 几万次点查的开销远大于一次全表扫描。
+    private func refreshAggregate(for items: [PurchaseDatabase.LineItem]) throws {
+        let touched = Set(items.filter { $0.kind == .iosApp }.map { AccountApp(dsid: $0.dsid, adamId: $0.adamId) })
+        guard !touched.isEmpty else { return }
+
+        if touched.count > 2000 {
+            for dsid in Set(touched.map(\.dsid)) {
+                try rebuildAggregateRaw(dsid: dsid, adamId: nil)
+            }
+        } else {
+            for entry in touched {
+                try rebuildAggregateRaw(dsid: entry.dsid, adamId: entry.adamId)
+            }
+        }
+    }
+
+    private struct AccountApp: Hashable {
+        let dsid: String
+        let adamId: String
+    }
+
+    /// adamId 为 nil 时重算整个账户。名称与图标取最近一次购买记录 —— App 会改名换图。
+    private func rebuildAggregateRaw(dsid: String, adamId: String?) throws {
+        let scope = adamId == nil ? "" : " AND adam_id = ?2"
+        // 名称/图标要取「最近一次购买」那行。用相关子查询逐组去捞，每组都得排一次序，
+        // 五万组能跑上几分钟；改成先一次分组求出 MIN/MAX，再按 (dsid, adam_id, pli_date)
+        // 索引连回最新那行，全程只有一次扫描加一次索引连接。
+        let sql = """
+            INSERT OR REPLACE INTO purchased_apps
+                (dsid, adam_id, first_date, last_date, purchase_count,
+                 name, developer, artwork_url, storefront_id, is_free)
+            SELECT g.dsid, g.adam_id, g.first_date, g.last_date, g.cnt,
+                   n.name, n.detail, n.artwork_url, n.storefront_id, g.is_free
+            FROM (
+                SELECT dsid, adam_id,
+                       MIN(pli_date) AS first_date, MAX(pli_date) AS last_date,
+                       COUNT(*) AS cnt, MIN(is_free) AS is_free
+                FROM line_items
+                WHERE dsid = ?1 AND line_item_type = 'IOSApp'\(scope)
+                GROUP BY dsid, adam_id
+            ) g
+            JOIN line_items n
+              ON n.dsid = g.dsid AND n.adam_id = g.adam_id
+             AND n.line_item_type = 'IOSApp' AND n.pli_date = g.last_date
+            GROUP BY g.dsid, g.adam_id;
+            """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.statement(lastErrorMessage())
+        }
+        defer { sqlite3_finalize(statement) }
+        bindText(statement, 1, dsid)
+        if let adamId { bindText(statement, 2, adamId) }
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw DatabaseError.statement(lastErrorMessage())
         }
     }
 
@@ -313,8 +400,7 @@ final class PurchaseDatabase {
         try queue.sync {
             let sql = """
                 SELECT a.dsid, a.name, a.email, a.last_synced_at, a.newest_pli_date,
-                       (SELECT COUNT(DISTINCT l.adam_id) FROM line_items l
-                         WHERE l.dsid = a.dsid AND l.line_item_type = 'IOSApp') AS app_count
+                       (SELECT COUNT(*) FROM purchased_apps p WHERE p.dsid = a.dsid) AS app_count
                 FROM accounts a
                 ORDER BY a.last_synced_at DESC;
                 """
@@ -341,6 +427,7 @@ final class PurchaseDatabase {
     func removeAll() throws {
         try queue.sync {
             try executeRaw("DELETE FROM line_items;")
+            try executeRaw("DELETE FROM purchased_apps;")
             try executeRaw("DELETE FROM accounts;")
         }
     }
@@ -348,12 +435,14 @@ final class PurchaseDatabase {
     func remove(dsid: String) throws {
         try queue.sync {
             var statement: OpaquePointer?
-            guard sqlite3_prepare_v2(handle, "DELETE FROM line_items WHERE dsid = ?1;", -1, &statement, nil) == SQLITE_OK else {
-                throw DatabaseError.statement(lastErrorMessage())
+            for sql in ["DELETE FROM line_items WHERE dsid = ?1;", "DELETE FROM purchased_apps WHERE dsid = ?1;"] {
+                guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {
+                    throw DatabaseError.statement(lastErrorMessage())
+                }
+                bindText(statement, 1, dsid)
+                sqlite3_step(statement)
+                sqlite3_finalize(statement)
             }
-            bindText(statement, 1, dsid)
-            sqlite3_step(statement)
-            sqlite3_finalize(statement)
 
             guard sqlite3_prepare_v2(handle, "DELETE FROM accounts WHERE dsid = ?1;", -1, &statement, nil) == SQLITE_OK else {
                 throw DatabaseError.statement(lastErrorMessage())
@@ -378,20 +467,16 @@ final class PurchaseDatabase {
                        offset: Int) throws -> [PurchasedApp] {
         try queue.sync {
             var sql = """
-                SELECT adam_id,
-                       MAX(pli_date) AS last_date,
-                       name, detail, artwork_url, storefront_id, is_free,
-                       COUNT(*) AS purchase_count,
-                       MIN(pli_date) AS first_date
-                FROM line_items
-                WHERE line_item_type = 'IOSApp' AND dsid = ?1
+                SELECT adam_id, name, developer, artwork_url, storefront_id,
+                       first_date, last_date, purchase_count, is_free
+                FROM purchased_apps
+                WHERE dsid = ?1
                 """
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                sql += " AND (name LIKE ?2 OR detail LIKE ?2 OR adam_id LIKE ?2)"
+                sql += " AND (name LIKE ?2 OR developer LIKE ?2 OR adam_id LIKE ?2)"
             }
-            // MIN()/MAX() 同时出现时裸列的归属没有保证，所以名称单独用子查询取最新那条。
-            sql += " GROUP BY adam_id ORDER BY first_date ASC, adam_id ASC LIMIT ?\(trimmed.isEmpty ? 2 : 3) OFFSET ?\(trimmed.isEmpty ? 3 : 4);"
+            sql += " ORDER BY first_date ASC, adam_id ASC LIMIT ?\(trimmed.isEmpty ? 2 : 3) OFFSET ?\(trimmed.isEmpty ? 3 : 4);"
 
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -409,51 +494,28 @@ final class PurchaseDatabase {
 
             var results: [PurchasedApp] = []
             while sqlite3_step(statement) == SQLITE_ROW {
-                let adamId = column(statement, 0)
-                let latest = try latestMetadata(adamId: adamId, dsid: dsid)
                 results.append(PurchasedApp(
-                    id: adamId,
-                    name: latest.name.isEmpty ? column(statement, 2) : latest.name,
-                    developer: latest.detail.isEmpty ? column(statement, 3) : latest.detail,
-                    artworkURL: latest.artwork.isEmpty ? column(statement, 4) : latest.artwork,
-                    storefrontId: column(statement, 5),
-                    firstPurchaseDate: column(statement, 8),
-                    lastPurchaseDate: column(statement, 1),
+                    id: column(statement, 0),
+                    name: column(statement, 1),
+                    developer: column(statement, 2),
+                    artworkURL: column(statement, 3),
+                    storefrontId: column(statement, 4),
+                    firstPurchaseDate: column(statement, 5),
+                    lastPurchaseDate: column(statement, 6),
                     purchaseCount: Int(sqlite3_column_int(statement, 7)),
-                    isFree: sqlite3_column_int(statement, 6) != 0
+                    isFree: sqlite3_column_int(statement, 8) != 0
                 ))
             }
             return results
         }
     }
 
-    /// App 会改名换图，展示该用最近一次购买记录里的名称与图标。
-    private func latestMetadata(adamId: String, dsid: String) throws -> (name: String, detail: String, artwork: String) {
-        var statement: OpaquePointer?
-        let sql = """
-            SELECT name, detail, artwork_url FROM line_items
-            WHERE adam_id = ?1 AND dsid = ?2 AND line_item_type = 'IOSApp'
-            ORDER BY pli_date DESC LIMIT 1;
-            """
-        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {
-            throw DatabaseError.statement(lastErrorMessage())
-        }
-        defer { sqlite3_finalize(statement) }
-        bindText(statement, 1, adamId)
-        bindText(statement, 2, dsid)
-        guard sqlite3_step(statement) == SQLITE_ROW else { return ("", "", "") }
-        return (column(statement, 0), column(statement, 1), column(statement, 2))
-    }
-
     func purchasedAppCount(dsid: String, matching query: String = "") throws -> Int {
         try queue.sync {
-            var sql = """
-                SELECT COUNT(DISTINCT adam_id) FROM line_items
-                WHERE line_item_type = 'IOSApp' AND dsid = ?1
-                """
+            var sql = "SELECT COUNT(*) FROM purchased_apps WHERE dsid = ?1"
             let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty {
-                sql += " AND (name LIKE ?2 OR detail LIKE ?2 OR adam_id LIKE ?2)"
+                sql += " AND (name LIKE ?2 OR developer LIKE ?2 OR adam_id LIKE ?2)"
             }
             var statement: OpaquePointer?
             guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {

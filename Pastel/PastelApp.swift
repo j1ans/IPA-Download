@@ -2187,9 +2187,10 @@ enum RightPanelMode: String, CaseIterable, Identifiable {
     case versions
     case download
     case batch
+    case purchases
     case logs
 
-    static let allCases: [RightPanelMode] = [.search, .batch, .download]
+    static let allCases: [RightPanelMode] = [.search, .purchases, .batch, .download]
 
     var id: String { rawValue }
 
@@ -2203,6 +2204,8 @@ enum RightPanelMode: String, CaseIterable, Identifiable {
             return String(localized: "下载")
         case .batch:
             return String(localized: "批量")
+        case .purchases:
+            return String(localized: "购买记录")
         case .logs:
             return String(localized: "日志")
         }
@@ -2218,6 +2221,8 @@ enum RightPanelMode: String, CaseIterable, Identifiable {
             return "arrow.down.circle"
         case .batch:
             return "square.stack.3d.down.right"
+        case .purchases:
+            return "bag"
         case .logs:
             return "terminal"
         }
@@ -2248,6 +2253,8 @@ struct ContentView: View {
     @StateObject private var downloads = DownloadManager()
     @StateObject private var catalog = CatalogViewModel()
     @StateObject private var batchList = BatchListStore()
+    @StateObject private var purchaseLibrary = PurchaseLibraryModel()
+    @StateObject private var purchaseSync = PurchaseSyncEngine()
 
     @State private var rightPanel = RightPanelMode.search
     @AppStorage("batchTargetGeneration") private var batchTargetGenerationID = "iOS 9"
@@ -2622,6 +2629,11 @@ struct ContentView: View {
                     .padding(.horizontal, 34)
                     .padding(.bottom, 30)
                     .frame(maxWidth: 1220, maxHeight: .infinity)
+            case .purchases:
+                PurchaseLibraryWorkspace(model: purchaseLibrary,
+                                         sync: purchaseSync,
+                                         batchList: batchList)
+                    .padding(.top, 62)
             case .logs:
                 logsWorkspace
                     .padding(.top, 82)
@@ -5042,6 +5054,10 @@ struct ContentView: View {
             case .batch:
                 batchWorkspace
                     .padding(20)
+            case .purchases:
+                PurchaseLibraryWorkspace(model: purchaseLibrary,
+                                         sync: purchaseSync,
+                                         batchList: batchList)
             case .logs:
                 logView
             }
@@ -5101,6 +5117,8 @@ struct ContentView: View {
                 .buttonStyle(.glassProminent)
                 .disabled(batchMatchedCount == 0 || batchIsResolving)
             }
+        case .purchases:
+            EmptyView()
         case .logs:
             Button {
                 downloads.clearFinished()
@@ -5705,7 +5723,7 @@ struct ContentView: View {
             case .versions:
                 selectAllDownloadedRows()
             }
-        case .batch, .logs:
+        case .batch, .purchases, .logs:
             break
         }
     }
@@ -5724,6 +5742,8 @@ struct ContentView: View {
             }
         case .batch:
             resolveBatchMatches()
+        case .purchases:
+            purchaseLibrary.reloadAccounts()
         case .logs:
             break
         }
