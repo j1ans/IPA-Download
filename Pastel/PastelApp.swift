@@ -1521,6 +1521,167 @@ struct VersionsResponse: Decodable {
     let errors: [String]
 }
 
+/// 一个设备/系统世代。版本 ID 落在 [startVersionID, endVersionID) 内的 App 版本，
+/// 大致就是这一代系统在售期间发布的，因而最可能跑得动。
+struct CompatibilityGeneration: Identifiable, Hashable {
+    let id: String
+    let device: String
+    let osName: String
+    let releaseDate: Date
+    let startVersionID: Int64
+    /// 下一代的起点（不含）；最后一代为 Int64.max。
+    let endVersionID: Int64
+
+    var title: String { "\(device) · \(osName)" }
+
+    func contains(versionID: Int64) -> Bool {
+        versionID >= startVersionID && versionID < endVersionID
+    }
+
+    /// 「完美兼容版」：落在本世代窗口内的版本按版本 ID 排序后取中位数。
+    /// 偶数个时取偏早的那一个 —— 窗口末尾的版本往往已经开始适配下一代系统了。
+    func perfectMatch(among records: [VersionRecord]) -> VersionRecord? {
+        let inWindow = records
+            .compactMap { record -> (record: VersionRecord, versionID: Int64)? in
+                guard let value = Int64(record.versionId.trimmingCharacters(in: .whitespaces)),
+                      contains(versionID: value)
+                else { return nil }
+                return (record, value)
+            }
+            .sorted { $0.versionID < $1.versionID }
+        guard !inWindow.isEmpty else { return nil }
+        return inWindow[(inWindow.count - 1) / 2].record
+    }
+}
+
+/// App Store 的外部版本 ID（softwareVersionExternalIdentifier）随时间单调递增，
+/// 所以可以反过来估算一个版本的发布时间 —— 这对 Apple 官方来源尤其有用，它只返回
+/// 版本 ID、不带任何日期。
+///
+/// 注意 Apple 在 2013 到 2014 年之间换过一次编号体系（16765251 → 691954036，量级
+/// 从千万跳到亿），因此只能在相邻锚点之间分段线性插值，不能对全体锚点做整体拟合。
+enum VersionIDTimeline {
+    struct Milestone: Hashable {
+        let device: String
+        let osName: String
+    }
+
+    struct Anchor {
+        let versionID: Int64
+        let date: Date
+        /// 对应的设备/系统里程碑；纯粹用于校准时间的锚点为 nil。
+        let milestone: Milestone?
+    }
+
+    private static func day(_ year: Int, _ month: Int, _ dayOfMonth: Int) -> Date {
+        var components = DateComponents()
+        components.year = year
+        components.month = month
+        components.day = dayOfMonth
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC") ?? .gmt
+        return calendar.date(from: components) ?? Date(timeIntervalSince1970: 0)
+    }
+
+    /// 按版本 ID 升序排列。
+    static let anchors: [Anchor] = [
+        Anchor(versionID: 17191, date: day(2008, 7, 2),
+               milestone: Milestone(device: "iPhone 3G", osName: "iPhone OS 2")),
+        Anchor(versionID: 1804602, date: day(2009, 6, 24),
+               milestone: Milestone(device: "iPhone 3GS", osName: "iPhone OS 3")),
+        Anchor(versionID: 1996524, date: day(2009, 10, 1), milestone: nil),
+        Anchor(versionID: 2243141, date: day(2010, 2, 11),
+               milestone: Milestone(device: "iPad", osName: "iPhone OS 3.2")),
+        Anchor(versionID: 2479772, date: day(2010, 4, 1), milestone: nil),
+        Anchor(versionID: 2694492, date: day(2010, 6, 15),
+               milestone: Milestone(device: "iPhone 4", osName: "iOS 4.0 – 4.2.1")),
+        Anchor(versionID: 3493095, date: day(2011, 3, 10),
+               milestone: Milestone(device: "iPad 2", osName: "iOS 4.3")),
+        Anchor(versionID: 4375195, date: day(2011, 10, 12),
+               milestone: Milestone(device: "iPhone 4s", osName: "iOS 5.0")),
+        Anchor(versionID: 6811179, date: day(2012, 3, 7),
+               milestone: Milestone(device: "iPad 3", osName: "iOS 5.1")),
+        Anchor(versionID: 10631785, date: day(2012, 9, 19),
+               milestone: Milestone(device: "iPhone 5", osName: "iOS 6")),
+        Anchor(versionID: 16765251, date: day(2013, 9, 9),
+               milestone: Milestone(device: "iPhone 5s", osName: "iOS 7")),
+        Anchor(versionID: 691954036, date: day(2014, 9, 9),
+               milestone: Milestone(device: "iPhone 6", osName: "iOS 8")),
+        Anchor(versionID: 813149787, date: day(2015, 9, 16),
+               milestone: Milestone(device: "iPhone 6s", osName: "iOS 9")),
+        Anchor(versionID: 818235653, date: day(2016, 9, 8),
+               milestone: Milestone(device: "iPhone 7", osName: "iOS 10")),
+        Anchor(versionID: 823376582, date: day(2017, 9, 7),
+               milestone: Milestone(device: "iPhone 8", osName: "iOS 11")),
+        Anchor(versionID: 827835179, date: day(2018, 9, 12),
+               milestone: Milestone(device: "iPhone XS", osName: "iOS 12")),
+        Anchor(versionID: 832677291, date: day(2019, 9, 11),
+               milestone: Milestone(device: "iPhone 11", osName: "iOS 13")),
+        Anchor(versionID: 837795168, date: day(2020, 9, 16),
+               milestone: Milestone(device: "iPad Air 4", osName: "iOS 14.0")),
+        Anchor(versionID: 838141530, date: day(2020, 10, 13),
+               milestone: Milestone(device: "iPhone 12", osName: "iOS 14.1")),
+        Anchor(versionID: 844035757, date: day(2021, 9, 16),
+               milestone: Milestone(device: "iPhone 13", osName: "iOS 15")),
+        Anchor(versionID: 852042907, date: day(2022, 9, 8),
+               milestone: Milestone(device: "iPhone 14", osName: "iOS 16")),
+    ]
+
+    /// 带设备里程碑的锚点两两相邻构成一个世代窗口。
+    static let generations: [CompatibilityGeneration] = {
+        let marked = anchors.compactMap { anchor in
+            anchor.milestone.map { (anchor: anchor, milestone: $0) }
+        }
+        return marked.indices.map { index in
+            let entry = marked[index]
+            return CompatibilityGeneration(
+                id: String(entry.anchor.versionID),
+                device: entry.milestone.device,
+                osName: entry.milestone.osName,
+                releaseDate: entry.anchor.date,
+                startVersionID: entry.anchor.versionID,
+                endVersionID: index + 1 < marked.count ? marked[index + 1].anchor.versionID : Int64.max
+            )
+        }
+    }()
+
+    /// 估算发布时间。小于首个锚点时钳到首个锚点；大于末个锚点时按最后一段的斜率外推
+    /// （锚点表止于 2022，再往后只能是估算）。
+    static func approximateDate(forVersionID versionID: Int64) -> Date? {
+        guard let first = anchors.first, let last = anchors.last else { return nil }
+        if versionID <= first.versionID { return first.date }
+
+        if versionID >= last.versionID {
+            guard anchors.count >= 2 else { return last.date }
+            let previous = anchors[anchors.count - 2]
+            let span = Double(last.versionID - previous.versionID)
+            guard span > 0 else { return last.date }
+            let perID = last.date.timeIntervalSince(previous.date) / span
+            return last.date.addingTimeInterval(Double(versionID - last.versionID) * perID)
+        }
+
+        guard let upperIndex = anchors.firstIndex(where: { $0.versionID >= versionID }),
+              upperIndex > 0
+        else { return nil }
+        let lower = anchors[upperIndex - 1]
+        let upper = anchors[upperIndex]
+        let span = Double(upper.versionID - lower.versionID)
+        guard span > 0 else { return lower.date }
+        let ratio = Double(versionID - lower.versionID) / span
+        return lower.date.addingTimeInterval(upper.date.timeIntervalSince(lower.date) * ratio)
+    }
+
+    static func approximateDate(forVersionID versionID: String) -> Date? {
+        guard let value = Int64(versionID.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+        return approximateDate(forVersionID: value)
+    }
+
+    /// 该版本 ID 落在哪一代。
+    static func generation(forVersionID versionID: Int64) -> CompatibilityGeneration? {
+        generations.first { $0.contains(versionID: versionID) }
+    }
+}
+
 struct DownloadedItem: Identifiable, Hashable {
     let id: String
     let fileURL: URL
