@@ -5266,30 +5266,32 @@ struct ContentView: View {
             return ""
         }
 
-        var appName = !str("itemName").isEmpty ? str("itemName") : str("bundleDisplayName")
-        var bundleId = str("softwareVersionBundleId")
-        var version = str("bundleShortVersionString")
-
-        // Apple 元数据缺版本（老 App 常见），或整包没有元数据（第三方 / 脱壳 IPA）时，
-        // 回落到 App 自身的 Info.plist 取真实值。字段齐全就不读，避免多一次解压。
-        if version.isEmpty || bundleId.isEmpty || appName.isEmpty {
-            let info = appInfoPlist(fromIPA: path) ?? [:]
-            func infoStr(_ key: String) -> String {
-                if let s = info[key] as? String { return s }
-                if let n = info[key] as? NSNumber { return n.stringValue }
-                return ""
-            }
-            if version.isEmpty { version = infoStr("CFBundleShortVersionString") }
-            if version.isEmpty { version = str("bundleVersion") }
-            if version.isEmpty { version = infoStr("CFBundleVersion") }
-            if bundleId.isEmpty { bundleId = infoStr("CFBundleIdentifier") }
-            if appName.isEmpty { appName = infoStr("CFBundleDisplayName") }
-            if appName.isEmpty { appName = infoStr("CFBundleName") }
+        // 下载历史版本时，Apple 的 iTunesMetadata 描述的是这个 App「当前的最新版本」，
+        // 而不是实际下发的那个包：QQ 1.0 的包里 bundleShortVersionString 却写着 9.3.30。
+        // 所以版本号必须以 payload 自身的 Info.plist 为准，元数据只能兜底。
+        let info = appInfoPlist(fromIPA: path) ?? [:]
+        func infoStr(_ key: String) -> String {
+            if let s = info[key] as? String { return s }
+            if let n = info[key] as? NSNumber { return n.stringValue }
+            return ""
         }
 
+        var version = infoStr("CFBundleShortVersionString")
+        // iOS 3 之前没有 CFBundleShortVersionString，营销版本号就写在 CFBundleVersion 里。
+        if version.isEmpty { version = infoStr("CFBundleVersion") }
+        if version.isEmpty { version = str("bundleShortVersionString") }
+        if version.isEmpty { version = str("bundleVersion") }
         // 文件名只是最后的猜测：它取最后一个下划线之后的片段，未必是真实版本号。
         if version.isEmpty { version = filenameInfo.version }
+
+        // 名称相反：商店的 itemName 是本地化展示名，比包内的 CFBundleName 更合适。
+        var appName = !str("itemName").isEmpty ? str("itemName") : str("bundleDisplayName")
+        if appName.isEmpty { appName = infoStr("CFBundleDisplayName") }
+        if appName.isEmpty { appName = infoStr("CFBundleName") }
         if appName.isEmpty { appName = filenameInfo.name.isEmpty ? stem : filenameInfo.name }
+
+        var bundleId = str("softwareVersionBundleId")
+        if bundleId.isEmpty { bundleId = infoStr("CFBundleIdentifier") }
 
         let itemId = str("itemId")
         let groupKey = !itemId.isEmpty ? itemId : (!bundleId.isEmpty ? bundleId : appName)
@@ -5465,13 +5467,18 @@ struct ContentView: View {
         return list.split(separator: "\n").map(String.init)
     }
 
-    // Payload/<App>.app/Info.plist：老 App 的图标名与版本号都要靠它兜底。
+    // Payload/<App>.app/Info.plist：图标名与版本号的权威来源。
     private static func appInfoPlist(fromIPA path: String, entries: [String]? = nil) -> [String: Any]? {
-        let list = entries ?? zipEntries(fromIPA: path)
-        guard let entry = list.first(where: {
+        // 调用方没有现成清单时用模式缩小范围，省得为一个文件列出上千条目。
+        let list = entries ?? {
+            guard let data = runUnzip(["-Z1", path, "Payload/*/Info.plist"]),
+                  let text = String(data: data, encoding: .utf8) else { return [] }
+            return text.split(separator: "\n").map(String.init)
+        }()
+        guard let entry = list.filter({
                   $0.range(of: #"^Payload/[^/]+\.app/Info\.plist$"#,
                            options: [.regularExpression, .caseInsensitive]) != nil
-              }),
+              }).min(by: { $0.count < $1.count }),
               let data = runUnzip(["-p", path, zipEscape(entry)]),
               let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
         else { return nil }

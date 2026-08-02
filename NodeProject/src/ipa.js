@@ -181,21 +181,21 @@ export class Ipa {
         return s;
     }
 
-    // Apple 元数据缺名称/版本时（老 App 常见）文件名会带 UnknownApp / UnknownVer 占位。
-    // 包已经在本地了，直接读 IPA 内的 Info.plist 取真实值改名。
+    // 文件名是下载前按商店元数据定的，但下载历史版本时 Apple 的元数据描述的是
+    // App「当前的最新版本」而不是实际下发的包 —— QQ 1.0 会被命名成 QQ_9.3.30.ipa。
+    // 包已经在本地了，按 payload 内 Info.plist 的真实版本更正，与 App 内显示保持一致。
     async correctOutputName(song) {
         const meta = song?.metadata || {};
-        const needName = !meta.bundleDisplayName;
-        const needVersion = !meta.bundleShortVersionString;
-        if (!needName && !needVersion) return;
-
         const info = await readAppInfoPlist(this.out).catch(() => null);
         if (!info) return;
 
-        const name = needName ? sanitizeFileNamePart(info.CFBundleDisplayName || info.CFBundleName) : '';
-        const version = needVersion
-            ? sanitizeFileNamePart(info.CFBundleShortVersionString || info.CFBundleVersion)
-            : '';
+        // 名称用商店的本地化展示名；版本以包内为准，元数据只兜底。
+        const name = sanitizeFileNamePart(
+            meta.bundleDisplayName || info.CFBundleDisplayName || info.CFBundleName,
+        );
+        const version = sanitizeFileNamePart(
+            info.CFBundleShortVersionString || info.CFBundleVersion || meta.bundleShortVersionString,
+        );
         if (!name && !version) return;
 
         const current = path.basename(this.out, '.ipa');
