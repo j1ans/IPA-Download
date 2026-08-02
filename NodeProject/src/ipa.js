@@ -1,13 +1,58 @@
 import {promises as fsPromises} from 'fs';
 import os from 'os';
 import {createHash} from 'crypto';
+import {execFile} from 'child_process';
+import {promisify} from 'util';
 import path from 'path';
+import StreamZip from 'node-stream-zip';
+import plist from 'plist';
 import {Store} from './client.js';
 import {appPriceInfo} from './catalog.js';
 import {readCookieJar, restoreCookieJar} from './gsa.js';
 import {SignatureClient} from './Signature.js';
 import {download} from './downloader.js';
 import {t} from './i18n.js';
+
+const execFileAsync = promisify(execFile);
+
+let infoPlistTempSeq = 0;
+
+// Info.plist 多为二进制格式，plist 库只认 XML，交给 macOS 自带的 plutil 转换。
+async function parsePlistBuffer(buffer) {
+    if (buffer.subarray(0, 6).toString('latin1') !== 'bplist') {
+        return plist.parse(buffer.toString('utf8'));
+    }
+    const tmp = path.join(os.tmpdir(), `pastel-info-${process.pid}-${infoPlistTempSeq++}.plist`);
+    await fsPromises.writeFile(tmp, buffer);
+    try {
+        const {stdout} = await execFileAsync('/usr/bin/plutil', ['-convert', 'xml1', '-o', '-', tmp], {
+            maxBuffer: 32 * 1024 * 1024,
+        });
+        return plist.parse(stdout);
+    } finally {
+        await fsPromises.rm(tmp, {force: true}).catch(() => {});
+    }
+}
+
+// 读取 Payload/<App>.app/Info.plist；同名条目取路径最短的那个，即主 App 而非扩展。
+async function readAppInfoPlist(ipaPath) {
+    const zip = new StreamZip.async({file: ipaPath});
+    try {
+        const entries = await zip.entries();
+        const entry = Object.values(entries)
+            .filter(e => !e.isDirectory && /^Payload\/[^/]+\.app\/Info\.plist$/i.test(e.name))
+            .sort((a, b) => a.name.length - b.name.length)[0];
+        if (!entry) return null;
+        return await parsePlistBuffer(await zip.entryData(entry.name));
+    } finally {
+        await zip.close().catch(() => {});
+    }
+}
+
+function sanitizeFileNamePart(value) {
+    if (typeof value !== 'string') return '';
+    return value.replace(/[\/\\:\x00-\x1f]/g, '').replace(/^\.+/, '').trim();
+}
 
 const SESSION_TTL_MS = Number(process.env.IPA_SESSION_TTL_MS || 365 * 24 * 60 * 60 * 1000);
 const SESSION_FLOW_VERSION = 'appstore-direct-v1';
@@ -136,6 +181,37 @@ export class Ipa {
         return s;
     }
 
+    // Apple 元数据缺名称/版本时（老 App 常见）文件名会带 UnknownApp / UnknownVer 占位。
+    // 包已经在本地了，直接读 IPA 内的 Info.plist 取真实值改名。
+    async correctOutputName(song) {
+        const meta = song?.metadata || {};
+        const needName = !meta.bundleDisplayName;
+        const needVersion = !meta.bundleShortVersionString;
+        if (!needName && !needVersion) return;
+
+        const info = await readAppInfoPlist(this.out).catch(() => null);
+        if (!info) return;
+
+        const name = needName ? sanitizeFileNamePart(info.CFBundleDisplayName || info.CFBundleName) : '';
+        const version = needVersion
+            ? sanitizeFileNamePart(info.CFBundleShortVersionString || info.CFBundleVersion)
+            : '';
+        if (!name && !version) return;
+
+        const current = path.basename(this.out, '.ipa');
+        const suffix = current.endsWith('_no-update') ? '_no-update' : '';
+        const base = suffix ? current.slice(0, -suffix.length) : current;
+        const underscore = base.lastIndexOf('_');
+        const currentName = underscore > 0 ? base.slice(0, underscore) : base;
+        const currentVersion = underscore > 0 ? base.slice(underscore + 1) : '';
+
+        const target = path.join(this.dir, `${name || currentName}_${version || currentVersion}${suffix}.ipa`);
+        if (target === this.out) return;
+        await fsPromises.rename(this.out, target);
+        this.out = target;
+        console.log(t('name_corrected', {out: target}));
+    }
+
     // 判断 App 是否免费：优先用上层（App 界面）传入的价格信号，未知时用 iTunes lookup 兜底。
     // 仅免费 App 才允许主动申请购买许可；付费 App 一律不触发购买（已购买的会直接命中 AppInfo）。
     async isFreeApp(APPID) {
@@ -206,6 +282,7 @@ export class Ipa {
                 includeAppStoreMetadata: process.env.IPA_REMOVE_APP_STORE_UPDATE_METADATA !== '1',
             });
             await signer.sign(this.out);
+            await this.correctOutputName(song).catch(() => {});
 
             console.log(t('file_archived', {out: this.out}));
         } finally {
