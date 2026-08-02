@@ -4300,6 +4300,8 @@ struct ContentView: View {
                     }
                     .padding(.bottom, 6)
                 }
+
+                batchTotalProgress
             }
         }
         .onChange(of: batchTargetGenerationID) { _, _ in
@@ -4403,7 +4405,7 @@ struct ContentView: View {
 
             Spacer(minLength: 10)
 
-            batchResolutionLabel(for: entry)
+            batchRowTrailing(for: entry)
 
             Button {
                 batchList.remove(entry.id)
@@ -4420,6 +4422,126 @@ struct ContentView: View {
         .background {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(manualVersionBarFill)
+        }
+    }
+
+    private struct BatchProgressSummary {
+        var total = 0
+        var finished = 0
+        var failed = 0
+        var running = 0
+        var fraction: Double = 0
+    }
+
+    /// 汇总清单里所有已开始的任务。打包阶段与已结束（含失败）都按 100% 计入，
+    /// 否则总进度会卡在最后一段不动。
+    private var batchProgress: BatchProgressSummary {
+        var summary = BatchProgressSummary()
+        var accumulated = 0.0
+        for entry in batchList.entries {
+            guard let jobID = batchJobID(for: entry), let job = downloads.job(jobID) else { continue }
+            summary.total += 1
+            switch job.status {
+            case .done:
+                summary.finished += 1
+                accumulated += 1
+            case .failed:
+                summary.failed += 1
+                accumulated += 1
+            case .running:
+                summary.running += 1
+                accumulated += job.isPackaging ? 1 : min(max(job.progress ?? 0, 0), 1)
+            }
+        }
+        summary.fraction = summary.total == 0 ? 0 : accumulated / Double(summary.total)
+        return summary
+    }
+
+    @ViewBuilder
+    private var batchTotalProgress: some View {
+        let summary = batchProgress
+        if summary.total > 0 {
+            let percent = Int((summary.fraction * 100).rounded())
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 9) {
+                    Text(String(localized: "总进度"))
+                        .font(.callout.weight(.semibold))
+
+                    Text(batchProgressDetail(summary))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+
+                    Text("\(percent)%")
+                        .font(.callout.weight(.semibold))
+                        .monospacedDigit()
+                        .contentTransition(.numericText(value: Double(percent)))
+                        .animation(.smooth(duration: 0.28), value: percent)
+                }
+
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.accentColor.opacity(0.16))
+                        Capsule()
+                            .fill(Color.accentColor.opacity(0.92))
+                            .frame(width: proxy.size.width * summary.fraction)
+                    }
+                }
+                .frame(height: 8)
+                .animation(.smooth(duration: 0.28), value: summary.fraction)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .background {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(manualVersionBarFill)
+            }
+        }
+    }
+
+    private func batchProgressDetail(_ summary: BatchProgressSummary) -> String {
+        var parts = [String(localized: "完成 \(summary.finished)/\(summary.total)")]
+        if summary.running > 0 {
+            parts.append(String(localized: "进行中 \(summary.running)"))
+        }
+        if summary.failed > 0 {
+            parts.append(String(localized: "失败 \(summary.failed)"))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// 已解析出版本的条目才有对应的下载任务。
+    private func batchJobID(for entry: BatchListEntry) -> String? {
+        guard case .matched(let record) = batchResolutions[entry.id] else { return nil }
+        return "batch-\(entry.id)-\(record.versionId)"
+    }
+
+    /// 有任务在跑就把版本号和进度并排显示，让人一眼看出「哪个 App 的哪个版本下到几成」。
+    @ViewBuilder
+    private func batchRowTrailing(for entry: BatchListEntry) -> some View {
+        if let jobID = batchJobID(for: entry), let job = downloads.job(jobID) {
+            HStack(spacing: 9) {
+                batchResolutionLabel(for: entry)
+
+                switch job.status {
+                case .running:
+                    DownloadProgressPill(progress: job.progress, isPackaging: job.isPackaging)
+                case .done:
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.green)
+                        .help(String(localized: "下载完成"))
+                case .failed:
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.title3)
+                        .foregroundStyle(.red)
+                        .help(downloadErrorMessage(from: job.log))
+                }
+            }
+        } else {
+            batchResolutionLabel(for: entry)
         }
     }
 
@@ -4514,9 +4636,10 @@ struct ContentView: View {
 
         var started = 0
         for entry in batchList.entries {
-            guard case .matched(let record) = batchResolutions[entry.id] else { continue }
-            let jobID = "batch-\(entry.id)-\(record.versionId)"
-            guard !downloads.isRunning(jobID) else { continue }
+            guard case .matched(let record) = batchResolutions[entry.id],
+                  let jobID = batchJobID(for: entry),
+                  !downloads.isRunning(jobID)
+            else { continue }
 
             let config = RunConfig(
                 appleAccount: credentials.appleAccount,
