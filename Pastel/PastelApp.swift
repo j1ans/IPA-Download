@@ -1539,9 +1539,12 @@ struct CompatibilityGeneration: Identifiable, Hashable {
         versionID >= startVersionID && versionID < endVersionID
     }
 
-    /// 「完美兼容版」：落在本世代窗口内的版本按版本 ID 排序后取中位数。
-    /// 偶数个时取偏早的那一个 —— 窗口末尾的版本往往已经开始适配下一代系统了。
-    func perfectMatch(among records: [VersionRecord]) -> VersionRecord? {
+    /// 窗口内的候选版本，按「离中位数的远近」排序。
+    ///
+    /// 首选中位数：窗口开头的版本开发者还在用上一代 SDK，窗口末尾的又已经开始适配下一代，
+    /// 中间最稳。之后向两侧交替扩散，这样某个版本下不下来时，退到的仍然是本世代里最接近的。
+    /// 同样距离时取偏早的那个，理由同上。
+    func rankedMatches(among records: [VersionRecord]) -> [VersionRecord] {
         let inWindow = records
             .compactMap { record -> (record: VersionRecord, versionID: Int64)? in
                 guard let value = Int64(record.versionId.trimmingCharacters(in: .whitespaces)),
@@ -1550,8 +1553,22 @@ struct CompatibilityGeneration: Identifiable, Hashable {
                 return (record, value)
             }
             .sorted { $0.versionID < $1.versionID }
-        guard !inWindow.isEmpty else { return nil }
-        return inWindow[(inWindow.count - 1) / 2].record
+        guard !inWindow.isEmpty else { return [] }
+
+        let median = (inWindow.count - 1) / 2
+        var ordered = [inWindow[median].record]
+        var offset = 1
+        while ordered.count < inWindow.count {
+            if median - offset >= 0 { ordered.append(inWindow[median - offset].record) }
+            if median + offset < inWindow.count { ordered.append(inWindow[median + offset].record) }
+            offset += 1
+        }
+        return ordered
+    }
+
+    /// 「完美兼容版」，即候选里的首选。
+    func perfectMatch(among records: [VersionRecord]) -> VersionRecord? {
+        rankedMatches(among: records).first
     }
 }
 
@@ -1740,11 +1757,24 @@ final class BatchListStore: ObservableObject {
     }
 }
 
+/// 某个 App 在所选世代窗口内的候选版本，按离中位数的远近排好序。
+/// 下载失败时把游标往后挪一格，就换成本世代里次接近的版本重试。
+struct BatchCandidates: Equatable {
+    var records: [VersionRecord]
+    var index: Int = 0
+
+    var current: VersionRecord? {
+        records.indices.contains(index) ? records[index] : nil
+    }
+
+    var hasNext: Bool { index + 1 < records.count }
+}
+
 /// 清单里某个 App 针对当前所选系统世代的解析结果。
 enum BatchResolution: Equatable {
     case idle
     case loading
-    case matched(VersionRecord)
+    case matched(BatchCandidates)
     /// 查到了历史版本，但没有一个落在所选世代的窗口里。
     case noMatch(total: Int)
     case failed(String)
@@ -2224,6 +2254,11 @@ struct ContentView: View {
     @State private var batchResolutions: [String: BatchResolution] = [:]
     @State private var batchResolveTask: Task<Void, Never>?
     @State private var batchMessage = ""
+    /// 串行队列：待下载的 App ID，以及当前正在下的那个。
+    @State private var batchQueue: [String] = []
+    @State private var batchActiveEntryID: String?
+    @State private var batchAttempts: [String: Int] = [:]
+    @State private var batchFailures: [String: String] = [:]
     @State private var glassRefreshToken = 0
     @State private var pendingVerificationCode = ""
     @State private var showingVerificationPrompt = false
@@ -4304,10 +4339,17 @@ struct ContentView: View {
                 batchTotalProgress
             }
         }
+        .onChange(of: batchActiveJobSignature) { _, _ in
+            advanceBatchQueueIfNeeded()
+        }
         .onChange(of: batchTargetGenerationID) { _, _ in
-            // 换了目标系统，之前解析出的版本就不作数了。
+            // 换了目标系统，之前解析出的版本和排队中的下载就都不作数了。
             batchResolveTask?.cancel()
             batchResolveTask = nil
+            batchQueue.removeAll()
+            batchActiveEntryID = nil
+            batchAttempts.removeAll()
+            batchFailures.removeAll()
             batchResolutions.removeAll()
             batchMessage = ""
         }
@@ -4359,13 +4401,21 @@ struct ContentView: View {
                 }
                 .disabled(batchList.entries.isEmpty || batchIsResolving)
 
-                Button {
-                    startBatchDownloads()
-                } label: {
-                    Label(String(localized: "一键下载 \(batchMatchedCount) 个"), systemImage: "arrow.down.circle.fill")
+                if batchIsDownloading {
+                    Button(role: .destructive) {
+                        stopBatchDownloads()
+                    } label: {
+                        Label(String(localized: "停止"), systemImage: "stop.fill")
+                    }
+                } else {
+                    Button {
+                        startBatchDownloads()
+                    } label: {
+                        Label(String(localized: "一键下载 \(batchMatchedCount) 个"), systemImage: "arrow.down.circle.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(batchMatchedCount == 0 || batchIsResolving)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(batchMatchedCount == 0 || batchIsResolving)
             }
 
             if !batchMessage.isEmpty {
@@ -4512,9 +4562,11 @@ struct ContentView: View {
         return parts.joined(separator: " · ")
     }
 
-    /// 已解析出版本的条目才有对应的下载任务。
+    /// 已解析出版本的条目才有对应的下载任务。退档重试后版本变了，任务 ID 也随之变。
     private func batchJobID(for entry: BatchListEntry) -> String? {
-        guard case .matched(let record) = batchResolutions[entry.id] else { return nil }
+        guard case .matched(let candidates) = batchResolutions[entry.id],
+              let record = candidates.current
+        else { return nil }
         return "batch-\(entry.id)-\(record.versionId)"
     }
 
@@ -4555,13 +4607,31 @@ struct ContentView: View {
         case .loading:
             ProgressView()
                 .controlSize(.small)
-        case .matched(let record):
+        case .matched(let candidates):
             VStack(alignment: .trailing, spacing: 2) {
-                Text("v\(record.version)")
-                    .font(.callout.weight(.medium))
-                Text(VersionIDTimeline.approximateDateText(forVersionID: record.versionId) ?? record.versionId)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 5) {
+                    if candidates.index > 0 {
+                        // 首选版本没下下来，现在用的是退档后的相邻版本。
+                        Image(systemName: "arrow.uturn.down.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .help(String(localized: "首选版本下载失败，已退到第 \(candidates.index + 1) 接近的版本"))
+                    }
+                    Text("v\(candidates.current?.version ?? "")")
+                        .font(.callout.weight(.medium))
+                }
+                if let failure = batchFailures[entry.id] {
+                    Text(failure)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                } else {
+                    Text(candidates.current.flatMap {
+                        VersionIDTimeline.approximateDateText(forVersionID: $0.versionId)
+                    } ?? "")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
         case .noMatch(let total):
             Text(String(localized: "\(total) 个版本中无匹配"))
@@ -4622,21 +4692,69 @@ struct ContentView: View {
                 "--provider", "auto"
             ], timeout: 90)
             let response = try JSONDecoder().decode(VersionsResponse.self, from: data)
-            if let match = generation.perfectMatch(among: response.versions) {
-                return (entry.id, .matched(match))
+            let ranked = generation.rankedMatches(among: response.versions)
+            if ranked.isEmpty {
+                return (entry.id, .noMatch(total: response.versions.count))
             }
-            return (entry.id, .noMatch(total: response.versions.count))
+            return (entry.id, .matched(BatchCandidates(records: ranked)))
         } catch {
             return (entry.id, .failed(nodeQueryErrorMessage(error)))
         }
     }
 
-    private func startBatchDownloads() {
-        guard let credentials = resolveDownloadCredentials() else { return }
+    /// 同一个 App 最多试几个版本。付费未购买、会话失效之类的失败换多少版本都一样，
+    /// 靠 batchFailureIsAccountLevel 提前止损；这个上限兜住其余情况，免得在一个
+    /// App 上把整个窗口的版本挨个试一遍。
+    private static let batchMaxAttemptsPerApp = 5
 
-        var started = 0
-        for entry in batchList.entries {
-            guard case .matched(let record) = batchResolutions[entry.id],
+    private var batchIsDownloading: Bool {
+        batchActiveEntryID != nil || !batchQueue.isEmpty
+    }
+
+    private func startBatchDownloads() {
+        guard resolveDownloadCredentials() != nil else { return }
+
+        let pending = batchList.entries.compactMap { entry -> String? in
+            guard case .matched = batchResolutions[entry.id] else { return nil }
+            return entry.id
+        }
+        guard !pending.isEmpty else {
+            batchMessage = String(localized: "没有可开始的下载任务。")
+            return
+        }
+
+        batchQueue = pending
+        batchActiveEntryID = nil
+        batchAttempts.removeAll()
+        batchFailures.removeAll()
+        batchMessage = String(localized: "已排队 \(pending.count) 个 App，逐个下载中。")
+        startNextBatchDownload()
+    }
+
+    private func stopBatchDownloads() {
+        batchQueue.removeAll()
+        if let entryID = batchActiveEntryID,
+           let entry = batchList.entries.first(where: { $0.id == entryID }),
+           let jobID = batchJobID(for: entry) {
+            downloads.stop(id: jobID)
+        }
+        batchActiveEntryID = nil
+        batchMessage = String(localized: "已停止批量下载。")
+    }
+
+    /// 一次只下一个：Apple 对并发下载不友好，逐个来还能让 2FA 提示不至于同时冒出好几个。
+    private func startNextBatchDownload() {
+        guard batchActiveEntryID == nil else { return }
+        guard let credentials = resolveDownloadCredentials() else {
+            batchQueue.removeAll()
+            return
+        }
+
+        while !batchQueue.isEmpty {
+            let entryID = batchQueue.removeFirst()
+            guard let entry = batchList.entries.first(where: { $0.id == entryID }),
+                  case .matched(let candidates) = batchResolutions[entryID],
+                  let record = candidates.current,
                   let jobID = batchJobID(for: entry),
                   !downloads.isRunning(jobID)
             else { continue }
@@ -4649,13 +4767,111 @@ struct ContentView: View {
                 versionID: record.versionId,
                 downloadDir: credentials.downloadDir
             )
+            batchActiveEntryID = entryID
             downloads.start(id: jobID, label: "\(entry.name) \(record.version)", config: config)
-            started += 1
+            return
         }
 
-        batchMessage = started == 0
-            ? String(localized: "没有可开始的下载任务。")
-            : String(localized: "已开始 \(started) 个下载任务，进度见「下载」。")
+        batchActiveEntryID = nil
+        batchMessage = batchCompletionMessage()
+    }
+
+    /// 观察当前任务的状态变化。带上任务 ID，这样「上一个失败、下一个也立刻失败」时
+    /// 值仍然会变化，onChange 才会触发，队列不会卡死。
+    private var batchActiveJobSignature: String? {
+        guard let entryID = batchActiveEntryID,
+              let entry = batchList.entries.first(where: { $0.id == entryID }),
+              let jobID = batchJobID(for: entry),
+              let job = downloads.job(jobID)
+        else { return nil }
+
+        let token: String
+        switch job.status {
+        case .running: token = job.isPackaging ? "packaging" : "running"
+        case .done: token = "done"
+        case .failed: token = "failed"
+        }
+        return "\(jobID)|\(token)"
+    }
+
+    private func advanceBatchQueueIfNeeded() {
+        guard let entryID = batchActiveEntryID,
+              let entry = batchList.entries.first(where: { $0.id == entryID }),
+              let jobID = batchJobID(for: entry),
+              let job = downloads.job(jobID)
+        else { return }
+
+        switch job.status {
+        case .running:
+            break
+        case .done:
+            batchFailures[entryID] = nil
+            batchActiveEntryID = nil
+            startNextBatchDownload()
+        case .failed:
+            handleBatchFailure(for: entryID, log: job.log)
+        }
+    }
+
+    /// 某个版本没下下来：只要不是账户层面的问题，就退到本世代里次接近的版本再试。
+    private func handleBatchFailure(for entryID: String, log: String) {
+        let attempts = (batchAttempts[entryID] ?? 0) + 1
+        batchAttempts[entryID] = attempts
+        let reason = downloadErrorMessage(from: log)
+
+        guard case .matched(var candidates) = batchResolutions[entryID] else {
+            batchFailures[entryID] = reason
+            batchActiveEntryID = nil
+            startNextBatchDownload()
+            return
+        }
+
+        let canRetry = candidates.hasNext
+            && attempts < Self.batchMaxAttemptsPerApp
+            && !Self.batchFailureIsAccountLevel(log)
+
+        batchActiveEntryID = nil
+        if canRetry {
+            candidates.index += 1
+            batchResolutions[entryID] = .matched(candidates)
+            batchFailures[entryID] = nil
+            // 排回队首，立刻用新版本重试。
+            batchQueue.insert(entryID, at: 0)
+        } else {
+            batchFailures[entryID] = reason
+        }
+        startNextBatchDownload()
+    }
+
+    /// 这些失败换个版本重来结果一模一样 —— 问题出在账户或许可，不在这个版本。
+    private static func batchFailureIsAccountLevel(_ log: String) -> Bool {
+        let text = log
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("@@IPA:") }
+            .joined(separator: "\n")
+        guard !text.isEmpty else { return false }
+
+        if ipaIsVerificationChallenge(text) { return true }
+        let markers = [
+            "Your password has changed", "password token is expired", "本地会话可能已失效",
+            "账号或密码不正确", "wrong password", "invalid password",
+            "验证码不正确", "verification code",
+            "获取许可失败", "license", "付费应用未购买",
+        ]
+        return markers.contains { text.localizedCaseInsensitiveContains($0) }
+    }
+
+    private func batchCompletionMessage() -> String {
+        let summary = batchProgress
+        if summary.total == 0 { return "" }
+        let retried = batchAttempts.values.filter { $0 > 0 }.count
+        var text = String(localized: "批量下载结束：成功 \(summary.finished) 个，失败 \(summary.failed) 个。")
+        if retried > 0 {
+            text += String(localized: " \(retried) 个 App 曾退到相邻版本重试。")
+        }
+        return text
     }
 
     private func clearBatchList() {
@@ -4867,14 +5083,24 @@ struct ContentView: View {
             .buttonStyle(.glassProminent)
             .disabled((selectedDownloadJobID().map { downloads.isRunning($0) } ?? false) || activeAppID.isEmpty || selectedVersion == nil)
         case .batch:
-            Button {
-                startBatchDownloads()
-            } label: {
-                Label(String(localized: "一键下载"), systemImage: "arrow.down.circle.fill")
+            if batchIsDownloading {
+                Button {
+                    stopBatchDownloads()
+                } label: {
+                    Label(String(localized: "停止"), systemImage: "stop.fill")
+                }
+                .controlSize(.large)
+                .buttonStyle(.glass)
+            } else {
+                Button {
+                    startBatchDownloads()
+                } label: {
+                    Label(String(localized: "一键下载"), systemImage: "arrow.down.circle.fill")
+                }
+                .controlSize(.large)
+                .buttonStyle(.glassProminent)
+                .disabled(batchMatchedCount == 0 || batchIsResolving)
             }
-            .controlSize(.large)
-            .buttonStyle(.glassProminent)
-            .disabled(batchMatchedCount == 0 || batchIsResolving)
         case .logs:
             Button {
                 downloads.clearFinished()
